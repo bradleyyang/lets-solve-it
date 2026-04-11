@@ -10,13 +10,15 @@ This document is for **new teammates** and for **LLM-assisted coding**: it state
 Use **audio** (especially birds and wildlife) together with **text** so users can **search or retrieve clips** using natural language — often discussed in terms of **joint audio–text embeddings** (e.g. CLAP-style models), separate from classic **species-only classifiers**.
 
 **What this repository actually implements today**  
-A **data + experimentation** workspace:
+A **data pipeline + fine-tuning** workspace:
 
-1. **Fetch metadata** from [Xeno-canto](https://xeno-canto.org/) API v3 for a fixed query (`cnt:canada`) and export a **unified CSV**.
+1. **Fetch metadata** from [Xeno-canto](https://xeno-canto.org/) API v3 for a fixed query (\cnt:canada\) and export a **unified CSV**.
 2. **Explore** that CSV (counts, missing fields, bird vs non-bird heuristics) in a notebook.
-3. **Optional smoke test**: sample rows, **download** a few MP3s, build short **text captions** from CSV columns, run **Hugging Face LAION CLAP** and print **audio–text similarity** scores.
+3. **Bulk-download** ~17 k audio recordings with adaptive concurrency and resume support.
+4. **Build training labels** using multi-template taxonomy strings and RAG-enriched descriptions.
+5. **Fine-tune CLAP** (\laion/clap-htsat-fused\) on 96 k \(audio, text)\ pairs with contrastive loss, AMP, and gradient accumulation.
 
-There is **no production web app**, **no training pipeline**, and **no Cornell / RAG “enriched descriptions”** implemented in code here yet — only the **thin captions** built in `mini_clap_xc_sample.py` (`Recording of {common_name}: {vocalization_type}`).
+There is no production web app or API server yet.
 
 ---
 
@@ -26,13 +28,30 @@ There is **no production web app**, **no training pipeline**, and **no Cornell /
 |------|--------|
 | `README.md` | Minimal setup: venv, `pip install`, env check, optional CLAP test |
 | `requirements.txt` | Pinned **core** stack (pandas, requests, jupyter, …) |
-| `requirements-ml.txt` | **Optional** PyTorch / `transformers` / librosa for CLAP script |
+| `requirements-ml.txt` | PyTorch / `transformers` / librosa for CLAP training and inference |
 | `scripts/get_xenocanto.ipynb` | **Source of truth** for building `xc_metadata_unified.csv` from API v3 |
-| `scripts/eda_xc_metadata.ipynb` | EDA on the CSV;-documents taxon mix (birds, frogs, bats, soundscapes, …) |
+| `scripts/eda_xc_metadata.ipynb` | EDA on the CSV — taxon mix, vocalization labels, missing fields |
 | `scripts/check_environment.py` | Validates Python, imports, CSV presence, `.env` / `XC_API_KEY`, live API ping |
 | `scripts/mini_clap_xc_sample.py` | End-to-end **sample**: CSV → download MP3s → HF CLAP similarities |
-| `scripts/xc_metadata_unified.csv` | **Committed artifact** (~18k rows) — full metadata export (when present) |
-| `scripts/data/` | **Gitignored** — default download dir for `mini_clap_xc_sample.py` (`xc_mini/`) |
+| `scripts/download_xc_audio.py` | **Bulk downloader** — ~17 k MP3s, 30 threads, adaptive 429 handling, resume ([docs](docs/download_xc_audio.md)) |
+| `scripts/download_xc_first_half.py` | Wrapper — shard 1/2 for two-machine parallel download |
+| `scripts/download_xc_second_half.py` | Wrapper — shard 2/2 for two-machine parallel download |
+| `scripts/train_clap.py` | **Fine-tunes CLAP** with contrastive loss, AMP, grad accumulation, checkpointing ([docs](docs/train_clap.md)) |
+| `scripts/build_clap_labels.py` | Builds `data/clap_all_labels.json` — 5 taxonomy templates + rich descriptions per `(species, type)` |
+| `scripts/build_clap_training_pairs.py` | Expands labels → `data/clap_train_pairs.json` / `data/clap_val_pairs.json` |
+| `scripts/generate_clap_descriptions.py` | GPT-generated rich text descriptions → `data/clap_descriptions.json` |
+| `scripts/build_taxonomy_db.py` | GBIF taxonomy lookup → `data/species_taxonomy.json` |
+| `scripts/xc_metadata_unified.csv` | **Committed artifact** (~18k rows) — full metadata export |
+| `scripts/data/` | **Gitignored** — audio downloads (`xc_audio/`), mini sample (`xc_mini/`) |
+| `data/clap_train_pairs.json` | **96 k** `{audio, text}` training pairs |
+| `data/clap_val_pairs.json` | **10 k** `{audio, text}` validation pairs |
+| `data/clap_all_labels.json` | Label pool — 2 739 `(species, type)` keys → list of text variants |
+| `data/species_taxonomy.json` | Cached GBIF taxonomy per species |
+| `data/clap_descriptions.json` | RAG-generated rich descriptions per species |
+| `docs/` | Extended documentation for new scripts |
+| `docs/train_clap.md` | Full reference for `train_clap.py` |
+| `docs/download_xc_audio.md` | Full reference for the bulk downloader scripts |
+| `checkpoints/` | **Gitignored** — `best.pt` and `latest.pt` written by `train_clap.py` |
 
 **Notebooks may write CSVs relative to the Jupyter **current working directory** (often `scripts/` if the server was started there). The fetch notebook saves `xc_metadata_unified.csv` next to the CWD; `check_environment.py` and `mini_clap_xc_sample.py` look in **`scripts/` first**, then repo root.
 
@@ -70,18 +89,23 @@ filepath,species_code,common_name,vocalization_type,quality_rating,duration,sour
 ### Done (working in repo)
 
 - **API v3 ingestion** with `XC_API_KEY`, pagination, unified schema → CSV (`get_xenocanto.ipynb`).
-- **Large CSV** checked in (or regenerable) for Canada-tagged recordings — includes **birds and non-birds** (amphibians, mammals, insects, soundscapes) because **`cnt:canada` is geographic, not taxonomic**.
+- **Large CSV** (~18 k rows) for Canada-tagged recordings — includes birds and non-birds.
 - **Environment verification** (`check_environment.py`) including optional HF CLAP processor download (`--with-ml`).
 - **EDA notebook** for distribution and data-quality questions.
-- **CLAP smoke test** using **Transformers** (`laion/clap-htsat-fused`), not the older `laion_clap` package.
+- **CLAP smoke test** using **Transformers** (`laion/clap-htsat-fused`).
+- **Bulk audio downloader** (`download_xc_audio.py`) — 30 concurrent threads, adaptive 429 handling, resume, two-machine sharding.
+- **~17 k MP3s downloaded** (~62 GB) to `scripts/data/xc_audio/`.
+- **Multi-template label builder** (`build_clap_labels.py`) — 5 taxonomy templates + rich descriptions per `(species, type)`.
+- **Training pair builder** (`build_clap_training_pairs.py`) — 96 k train / 10 k val `(audio, text)` pairs.
+- **CLAP fine-tuning script** (`train_clap.py`) — symmetric InfoNCE loss, AMP, gradient accumulation, cosine LR, checkpointing, val R@1 metric.
 
 ### Not done (out of scope or future work)
 
 - Bird-only filtering (explicit taxon rules or allowlist).
-- Bulk audio download for the full 18k rows (would be heavy; respect Xeno-canto **terms and rate limits**).
-- Fine-tuning CLAP or training custom models.
 - Dashboard / API server.
-- Cornell / external **enriched text** pipeline (RAG, scraping) — **strategy TBD**; current captions are **template-only**.
+- Evaluation harness / retrieval benchmark beyond R@1.
+- Multi-GPU / distributed training.
+- LoRA / PEFT (currently full fine-tune only).
 
 ---
 
@@ -109,12 +133,30 @@ python scripts/check_environment.py
 python scripts/check_environment.py --with-ml   # after: pip install -r requirements-ml.txt
 ```
 
-Optional CLAP sample (needs **ffmpeg** on PATH for MP3 on many systems):
+Optional CLAP smoke test (needs **ffmpeg** on PATH for MP3 on many systems):
 
 ```bash
 pip install -r requirements-ml.txt
 python scripts/mini_clap_xc_sample.py --sample 6
 ```
+
+Bulk audio download (first run takes hours; safe to interrupt and resume):
+
+```bash
+python scripts/download_xc_audio.py          # full corpus, 30 threads, adaptive throttle
+python scripts/download_xc_first_half.py     # half for developer A
+python scripts/download_xc_second_half.py    # half for developer B (different network)
+```
+
+Fine-tune CLAP (requires GPU + ffmpeg + ~62 GB audio already downloaded):
+
+```bash
+python scripts/train_clap.py                            # default settings
+python scripts/train_clap.py --batch-size 4 --accum 16 # low VRAM
+python scripts/train_clap.py --resume checkpoints/latest.pt
+```
+
+See `docs/train_clap.md` and `docs/download_xc_audio.md` for full CLI reference.
 
 Jupyter: open `scripts/get_xenocanto.ipynb` or `scripts/eda_xc_metadata.ipynb` (ensure kernel uses the same venv).
 
@@ -129,7 +171,8 @@ Jupyter: open `scripts/get_xenocanto.ipynb` or `scripts/eda_xc_metadata.ipynb` (
 
 ### API and scraping etiquette
 
-- The mini script sleeps **~0.35s** between downloads; **do not** remove throttling or parallelize aggressively without team + site policy agreement.
+- download_xc_audio.py uses **adaptive concurrency** (default 30 threads, backs off to 4 on 429 bursts). Do not disable the adaptive logic or use extreme concurrency without monitoring for 429 responses.
+- The mini sample script (mini_clap_xc_sample.py) sleeps ~0.35 s between downloads; keep that for its small-scale usage.
 - Use a **identifying User-Agent** when adding new HTTP clients (see `HEADERS` in `mini_clap_xc_sample.py`).
 - `check_environment.py` performs a **minimal** API call when `XC_API_KEY` is set; avoid wrapping it in tight CI loops that hammer Xeno-canto.
 
@@ -170,11 +213,12 @@ Jupyter: open `scripts/get_xenocanto.ipynb` or `scripts/eda_xc_metadata.ipynb` (
 
 ## 8. Suggested next steps (prioritized)
 
-1. **Product decision:** Canada **all-taxa** vs **birds-only** — if birds-only, add a **filtering step** (post-CSV or API query) and document counts in EDA.
-2. **Caption / “enriched description” v1:** define a **single function** (e.g. `build_caption(row) -> str`) used by both notebooks and CLAP code; add unit tests for edge cases (`soundscape`, empty `common_name`, commas).
-3. **Download pipeline:** optional script to fetch audio for a **subset** (with disk quota, resume, and rate limits) producing a manifest alongside CSV.
-4. **Evaluation harness:** small set of labeled pairs or human spot-checks for retrieval quality before scaling fine-tuning.
-5. **Module split:** move `fetch_xc_page` / `clean_to_unified_schema` from notebook into `scripts/xc_api.py` (or similar) to reduce notebook drift.
+1. **Run 	rain_clap.py** end-to-end -- smoke test on 1 k pairs, then full corpus. Check val loss and R@1 curves for signs of overfitting or LR issues.
+2. **Evaluation harness** -- build a small held-out set of labeled retrieval queries; report R@1, R@5, and median rank so you can compare checkpoints.
+3. **Bird-only filtering** -- cnt:canada includes frogs, bats, and soundscapes. Add an explicit allowlist or taxonomy filter and re-run pair building.
+4. **LoRA / PEFT** -- if full fine-tune OOMs on the target GPU, add a --lora flag using peft library (small adapter weights, same base checkpoint).
+5. **Multi-GPU** -- wrap model in 	orch.nn.DataParallel or DistributedDataParallel for systems with more than one GPU.
+6. **Module split** -- move etch_xc_page / clean_to_unified_schema from notebook into scripts/xc_api.py to reduce notebook drift.
 
 ---
 
