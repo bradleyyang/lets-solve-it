@@ -24,6 +24,8 @@ Outputs
 -------
   checkpoints/best.pt          state_dict with lowest val loss
   checkpoints/latest.pt        overwritten every epoch — safe resume point
+  checkpoints/epochs/epoch_NN.pt   full copy after each epoch (same payload as latest;
+                               use --no-epoch-checkpoints to skip — each file is ~1.8 GB)
 
 Prerequisites
 -------------
@@ -51,6 +53,7 @@ import json
 import math
 import sys
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -64,8 +67,9 @@ from transformers import ClapModel, ClapProcessor
 
 try:
     import librosa
+    import soundfile as sf
 except ImportError:
-    print("Missing librosa.  Run: pip install -r requirements-ml.txt", file=sys.stderr)
+    print("Missing librosa / soundfile.  Run: pip install -r requirements-ml.txt", file=sys.stderr)
     raise
 
 # ── constants ──────────────────────────────────────────────────────────────────
@@ -85,14 +89,41 @@ def load_audio(path: Path, sr: int = TARGET_SR, clip_s: float = CLIP_DURATION_S)
     """
     Load MP3/WAV at `sr` Hz, mono.  Centre-crops or pads to `clip_s` seconds.
     Returns None when the file cannot be decoded or is too short.
+
+    Fast path: if convert_to_wav.py has already produced a pre-clipped .wav
+    sibling (same filename, .wav extension), that file is read directly with
+    soundfile — no MP3 decoding, no resampling, no crop/pad needed since the
+    WAV was written at exactly (sr, clip_s) by the converter.
     """
+    target_len = int(clip_s * sr)
+    min_len    = int(MIN_DURATION_S * sr)
+
+    # --- fast path: pre-clipped WAV produced by convert_to_wav.py ---
+    wav_path = path.with_suffix(".wav")
+    if wav_path.is_file():
+        try:
+            y, file_sr = sf.read(str(wav_path), dtype="float32", always_2d=False)
+            # If the WAV has the right length it's pre-clipped — return immediately.
+            if file_sr == sr and len(y) == target_len:
+                return y
+            # WAV exists but was not pre-clipped (e.g. older conversion); fall
+            # through to the normal path using the WAV instead of MP3.
+            if len(y) < min_len:
+                return None
+            if len(y) >= target_len:
+                start = (len(y) - target_len) // 2
+                y = y[start : start + target_len]
+            else:
+                y = np.pad(y, (0, target_len - len(y)))
+            return y.astype(np.float32)
+        except Exception:
+            pass  # corrupt WAV — fall through to librosa with the original file
+
+    # --- slow path: decode MP3 (or any format) via librosa ---
     try:
         y, _ = librosa.load(str(path), sr=sr, mono=True)
     except Exception:
         return None
-
-    target_len = int(clip_s * sr)
-    min_len    = int(MIN_DURATION_S * sr)
 
     if len(y) < min_len:
         return None
@@ -149,7 +180,7 @@ class ClapPairDataset(Dataset):
         if verbose:
             print(
                 f"  [{pairs_path.name}]  {len(self.pairs):,} usable pairs "
-                f"({missing:,} skipped — audio file not found)"
+                f"({missing:,} skipped - audio file not found)"
             )
 
     def __len__(self) -> int:
@@ -167,10 +198,9 @@ def collate_fn(
     batch: list[dict[str, Any] | None],
     processor: ClapProcessor,
     sr: int,
-    device: torch.device,
 ) -> dict[str, Tensor] | None:
     """
-    Filters None items, calls ClapProcessor, returns tensors on device.
+    Filters None items, calls ClapProcessor, returns CPU tensors (pin_memory-safe).
     Returns None when the entire batch is empty (shouldn't happen in practice).
     """
     valid = [b for b in batch if b is not None]
@@ -188,7 +218,11 @@ def collate_fn(
         padding         = True,
         truncation      = True,
     )
-    return {k: v.to(device) for k, v in inputs.items()}
+    return {k: v for k, v in inputs.items()}
+
+
+def batch_to_device(batch: dict[str, Tensor], device: torch.device) -> dict[str, Tensor]:
+    return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
 
 # ── loss ───────────────────────────────────────────────────────────────────────
@@ -228,8 +262,11 @@ def recall_at_1(
     text_embs:  list[Tensor] = []
 
     for i, batch in enumerate(loader):
-        if batch is None or i >= max_batches:
+        if i >= max_batches:
             break
+        if batch is None:
+            continue
+        batch = batch_to_device(batch, device)
         with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
             a_feat = model.get_audio_features(
                 input_features  = batch.get("input_features"),
@@ -240,7 +277,7 @@ def recall_at_1(
                 attention_mask  = batch.get("attention_mask"),
             )
         audio_embs.append(F.normalize(a_feat.pooler_output, dim=-1).cpu())
-        text_embs.append( F.normalize(t_feat.pooler_output, dim=-1).cpu())
+        text_embs.append(F.normalize(t_feat.pooler_output, dim=-1).cpu())
 
     if not audio_embs:
         return 0.0
@@ -315,6 +352,7 @@ def train_one_epoch(
     for step, batch in enumerate(pbar):
         if batch is None:
             continue
+        batch = batch_to_device(batch, device)
 
         with torch.autocast(device_type=device.type, enabled=use_amp):
             audio_feat = model.get_audio_features(
@@ -362,6 +400,7 @@ def validate(
     for batch in tqdm(loader, desc="val", unit="batch", dynamic_ncols=True):
         if batch is None:
             continue
+        batch = batch_to_device(batch, device)
         with torch.autocast(device_type=device.type, enabled=use_amp):
             audio_feat = model.get_audio_features(
                 input_features  = batch.get("input_features"),
@@ -431,6 +470,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Resume from a checkpoint file produced by this script",
     )
     ap.add_argument(
+        "--no-epoch-checkpoints",
+        action="store_true",
+        help="Do not write checkpoints/<epoch-checkpoints-subdir>/epoch_NN.pt each epoch",
+    )
+    ap.add_argument(
+        "--epoch-checkpoints-subdir",
+        default="epochs",
+        help="Subfolder under --checkpoint-dir for per-epoch copies (default: epochs)",
+    )
+    ap.add_argument(
         "--seed", type=int, default=42,
         help="Random seed (default 42)",
     )
@@ -453,22 +502,23 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Device:       {device}  (AMP {'on' if use_amp else 'off'})")
     print(f"Model:        {args.model}")
     print(f"Audio root:   {args.audio_root}")
-    print(f"Batch size:   {args.batch_size}  ×  accum {args.accum}  =  effective {args.batch_size * args.accum}")
+    print(f"Batch size:   {args.batch_size}  x  accum {args.accum}  =  effective {args.batch_size * args.accum}")
     print(f"Epochs:       {args.epochs}  |  LR: {args.lr}  |  warmup: {args.warmup_steps}")
 
     # ── processor + model ─────────────────────────────────────────────────────
-    print("\nLoading processor and model weights …")
+    print("\nLoading processor and model weights ...")
     processor = ClapProcessor.from_pretrained(args.model)
     model: ClapModel = ClapModel.from_pretrained(args.model)
     model.to(device)
 
     # ── datasets ──────────────────────────────────────────────────────────────
     audio_root = Path(args.audio_root)
-    print("\nBuilding datasets …")
+    print("\nBuilding datasets ...")
     train_ds = ClapPairDataset(Path(args.train_pairs), audio_root, clip_s=args.clip_s)
     val_ds   = ClapPairDataset(Path(args.val_pairs),   audio_root, clip_s=args.clip_s)
 
-    _collate = lambda b: collate_fn(b, processor, TARGET_SR, device)
+    # Must be picklable on Windows (spawn): no lambda; partial of module-level collate_fn.
+    _collate = partial(collate_fn, processor=processor, sr=TARGET_SR)
 
     train_loader = DataLoader(
         train_ds,
@@ -514,19 +564,32 @@ def main(argv: list[str] | None = None) -> int:
     if args.resume:
         resume_path = Path(args.resume)
         if resume_path.is_file():
-            print(f"\nResuming from {resume_path} …")
+            print(f"\nResuming from {resume_path} ...")
             start_epoch, best_val_loss = load_checkpoint(
                 resume_path, model, optimizer, scaler, scheduler
             )
             start_epoch += 1
-            print(f"  → starting at epoch {start_epoch}, best_val_loss={best_val_loss:.4f}")
+            if not math.isfinite(best_val_loss):
+                best_sidecar = ckpt_dir / "best.pt"
+                if best_sidecar.is_file():
+                    ck = torch.load(
+                        best_sidecar, map_location="cpu", weights_only=False
+                    )
+                    bvl = ck.get("best_val_loss")
+                    if bvl is not None and math.isfinite(float(bvl)):
+                        best_val_loss = float(bvl)
+                        print(
+                            f"  -> best_val_loss from {best_sidecar.name}: "
+                            f"{best_val_loss:.4f} (resume ckpt had non-finite best)"
+                        )
+            print(f"  -> starting at epoch {start_epoch}, best_val_loss={best_val_loss:.4f}")
         else:
             print(f"Warning: checkpoint {resume_path} not found, starting fresh.", file=sys.stderr)
 
     # ── training ──────────────────────────────────────────────────────────────
-    print(f"\n{'─' * 60}")
+    print(f"\n{'-' * 60}")
     print(f"Starting training   ({len(train_ds):,} train  |  {len(val_ds):,} val pairs)")
-    print(f"{'─' * 60}\n")
+    print(f"{'-' * 60}\n")
 
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
@@ -557,20 +620,28 @@ def main(argv: list[str] | None = None) -> int:
             f"({elapsed:.0f}s)"
         )
 
-        # Save latest regardless
-        save_checkpoint(
-            ckpt_dir / "latest.pt",
-            model, optimizer, scaler, scheduler, epoch, best_val_loss,
-        )
-
-        # Save best
+        # Update best before saving latest (latest.pt must carry correct best_val_loss for resume)
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             save_checkpoint(
                 ckpt_dir / "best.pt",
                 model, optimizer, scaler, scheduler, epoch, best_val_loss,
             )
-            print(f"  ✓  new best val_loss={best_val_loss:.4f}  →  {ckpt_dir}/best.pt")
+            print(f"  [OK] new best val_loss={best_val_loss:.4f}  ->  {ckpt_dir}/best.pt")
+
+        save_checkpoint(
+            ckpt_dir / "latest.pt",
+            model, optimizer, scaler, scheduler, epoch, best_val_loss,
+        )
+
+        if not args.no_epoch_checkpoints:
+            epoch_dir = ckpt_dir / args.epoch_checkpoints_subdir
+            epoch_path = epoch_dir / f"epoch_{epoch:02d}.pt"
+            save_checkpoint(
+                epoch_path,
+                model, optimizer, scaler, scheduler, epoch, best_val_loss,
+            )
+            print(f"  saved epoch snapshot  ->  {epoch_path}")
 
     print(f"\nTraining complete.  Best val loss: {best_val_loss:.4f}")
     print(f"Checkpoints: {ckpt_dir.resolve()}")
