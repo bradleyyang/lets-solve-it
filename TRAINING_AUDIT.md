@@ -1,7 +1,7 @@
-# CLAP Fine-Tuning Audit — 1st Run
+# CLAP Fine-Tuning Audit — 2nd-fine-tune (completed)
 
-**Date paused:** 2026-04-13  
-**Run:** epochs 0–8 complete; epoch 9 interrupted at ~0%  
+**Date completed:** 2026-04-13  
+**Run:** epochs 0-9 complete (10 total)  
 **Model:** `laion/clap-htsat-fused` fine-tuned on Xeno-canto audio  
 
 ---
@@ -17,9 +17,10 @@
 | 06 | 0.0163 | 1.8645 | 7.03% | ~2h 01m |
 | 07 | 0.0255 | 1.8423 | 7.42% | ~2h 03m |
 | 08 | 0.0214 | 1.8358 | 7.42% | ~2h 53m |
+| 09 | 0.0073 | 1.8330 | 7.23% | ~3h 14m |
 
 **Best checkpoint:** `best.pt` = end of epoch 0 (`val_loss=1.8329`)  
-**Latest checkpoint:** `checkpoints/epochs/epoch_08.pt`
+**Latest checkpoint:** `checkpoints/epochs/epoch_09.pt`
 
 ---
 
@@ -33,9 +34,9 @@ The model learned the training data well:
 
 This is expected and correct behavior. The learning signal exists and is flowing.
 
-### Val loss and R@1 hit a ceiling immediately
+### Val loss and R@1 hit a ceiling and stayed flat through epoch 9
 - Epoch 0 val_loss: **1.8329** — best ever
-- Epoch 4–8 val_loss: **1.8358–1.8856** — never better than epoch 0
+- Epoch 4-9 val_loss: **1.8330–1.8856** — never better than epoch 0
 - R@1: **5.66%** at epoch 0, hovers around **7%** later, never breaks 8%
 
 This is the red flag. The model trains fine but fails to generalize.
@@ -106,6 +107,22 @@ Rich descriptions perform no better than taxonomy chain — confirms the per-spe
 
 PDFs in `results/figures/`.
 
+### Final checkpoint evaluation (epoch 09)
+
+Run: `evaluate_clap.py --checkpoint checkpoints/latest.pt`  
+Output: `results/eval_results_epoch09.json` and `results/figures_epoch09/`
+
+| Strategy | mAP | MRR | R@1 | R@5 | R@10 |
+|---------|-----|-----|-----|-----|------|
+| common name | 0.355 | 0.457 | 17.7% | 43.3% | 56.0% |
+| scientific name | 0.346 | 0.451 | 16.7% | 43.3% | 53.5% |
+| taxonomy chain | 0.340 | 0.441 | 16.5% | 43.5% | 54.7% |
+| sci + common | 0.357 | 0.456 | 17.3% | 44.2% | 56.8% |
+| chain + common | **0.358** | **0.462** | **17.9%** | 44.1% | 56.1% |
+| rich description | 0.340 | 0.441 | 16.5% | 43.5% | 54.7% |
+
+Two validation clips could not be loaded during this run and were excluded by the evaluator. This does not change the central diagnosis: rich text remains no better than taxonomy-derived variants.
+
 ---
 
 ## 6. What to Fix in Run 2
@@ -165,23 +182,22 @@ Yes, for coarse species-level tasks:
 | File | Epoch | Val Loss | R@1 |
 |------|-------|---------|-----|
 | `checkpoints/best.pt` | 0 | 1.8329 | 5.7% |
-| `checkpoints/latest.pt` | 8 | 1.8358 | 7.4% |
+| `checkpoints/latest.pt` | 9 | 1.8330 | 7.2% |
 | `checkpoints/epochs/epoch_03.pt` | 3 | ~unknown | — |
 | `checkpoints/epochs/epoch_08.pt` | 8 | 1.8358 | 7.4% |
+| `checkpoints/epochs/epoch_09.pt` | 9 | 1.8330 | 7.2% |
 
 If starting a 2nd run, do **not** warm-start from these weights — the model learned shortcuts that will persist. Start from the base `laion/clap-htsat-fused` pretrained weights.
 
 ---
 
-## 9. Resume State
+## 9. Run State
 
-Training stopped after epoch 8 completes. Epoch 9 was killed at ~0% (no useful progress lost).
+Run reached its configured target (**10 epochs total: 00 through 09**) and exited normally.
 
-If you want to continue this run to epoch 9:
-```powershell
-$env:PYTHONUTF8 = "1"; $env:PYTHONUNBUFFERED = "1"; $env:HF_HUB_DISABLE_SYMLINKS_WARNING = "1"
-"`n=== RESUMED $(Get-Date -Format o) ===`n" | Out-File training_run.log -Append -Encoding utf8
-.\.venv\Scripts\python.exe -u scripts\train_clap.py --resume checkpoints\latest.pt --workers 8 2>&1 | Out-File training_run.log -Append -Encoding utf8
-```
+Terminal end-of-run summary:
+- `epoch 09  train_loss=0.0073  val_loss=1.8330  R@1=0.0723`
+- `saved epoch snapshot -> checkpoints/epochs/epoch_09.pt`
+- `Training complete. Best val loss: 1.8329`
 
-**Recommendation:** Don't bother with epoch 9 here. Start run 2 with improved data instead.
+**Recommendation:** For next experiments, start a fresh run from base CLAP with improved labels/data strategy rather than extending this checkpoint line.
