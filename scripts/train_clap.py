@@ -489,6 +489,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 # ── main ───────────────────────────────────────────────────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows consoles default to cp1252; force UTF-8 so tqdm/log output is not
+    # mixed with UTF-16 when PowerShell redirects (see checkpoints/RESUME.md).
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     args    = parse_args(argv)
     root    = repo_root()
     ckpt_dir = Path(args.checkpoint_dir)
