@@ -95,7 +95,7 @@ def get_combos(metadata_paths: list[str]) -> list[tuple[str, str]]:
         if not p.exists():
             print(f"  [skip] {path} not found")
             continue
-        df = pd.read_csv(p)
+        df = pd.read_csv(p, encoding="utf-8")
         # Accept either 'type' or 'vocalization_type' column
         name_col = next((c for c in ("common_name", "species", "name") if c in df.columns), None)
         type_col = next((c for c in ("vocalization_type", "type") if c in df.columns), None)
@@ -126,13 +126,13 @@ def main():
     # Load taxonomy DB (built by build_taxonomy_db.py — no network calls needed)
     if not TAXONOMY_DB.exists():
         raise SystemExit(f"ERROR: {TAXONOMY_DB} not found. Run build_taxonomy_db.py first.")
-    tax_db: dict = json.loads(TAXONOMY_DB.read_text())
+    tax_db: dict = json.loads(TAXONOMY_DB.read_text(encoding="utf-8"))
     print(f"Loaded taxonomy for {len(tax_db)} species from {TAXONOMY_DB}")
 
     # Load rich descriptions if available (from generate_clap_descriptions.py)
     rich_descs: dict = {}
     if RICH_DESC_PATH.exists():
-        rich_descs = json.loads(RICH_DESC_PATH.read_text())
+        rich_descs = json.loads(RICH_DESC_PATH.read_text(encoding="utf-8"))
         print(f"Loaded {len(rich_descs)} rich description keys from {RICH_DESC_PATH}")
     else:
         print(f"No rich descriptions at {RICH_DESC_PATH} — taxonomy templates only")
@@ -160,11 +160,15 @@ def main():
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(results, indent=2, ensure_ascii=False))
+    out_path.write_text(
+        json.dumps(results, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+        newline="\n",
+    )
 
-    print(f"\n{'─'*60}")
+    print(f"\n{'-'*60}")
     print(f"Done.")
-    print(f"  Labels written  : {len(results)} (species, type) pairs → {out_path}")
+    print(f"  Labels written  : {len(results)} (species, type) pairs -> {out_path}")
     print(f"  No taxonomy     : {no_tax} species (common name only template)")
     counts = [len(v) for v in results.values()]
     if counts:

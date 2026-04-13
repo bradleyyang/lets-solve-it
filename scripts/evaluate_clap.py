@@ -58,6 +58,7 @@ DEFAULT_OUTPUT     = Path("results/eval_results.json")
 DEFAULT_FIGURES    = Path("results/figures")
 AUDIO_SR           = 48_000
 CLIP_SECONDS       = 10
+MIN_DURATION_S     = 0.5  # match scripts/train_clap.py
 STRATEGY_ORDER     = ["name", "scientific", "chain", "sci_common", "chain_common", "rich"]
 STRATEGY_LABELS    = {
     "name":         "Common name",
@@ -74,19 +75,41 @@ STRATEGY_LABELS    = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_audio(path: Path, sr: int = AUDIO_SR, clip_s: float = CLIP_SECONDS):
+    """Load audio like train_clap.py: prefer pre-clipped .wav sibling, else librosa."""
     import librosa
+    import soundfile as sf
+
+    target_len = int(clip_s * sr)
+    min_len = int(MIN_DURATION_S * sr)
+    wav_path = path.with_suffix(".wav")
+    if wav_path.is_file():
+        try:
+            y, file_sr = sf.read(str(wav_path), dtype="float32", always_2d=False)
+            if file_sr == sr and len(y) == target_len:
+                return y
+            if len(y) < min_len:
+                return None
+            if len(y) >= target_len:
+                start = (len(y) - target_len) // 2
+                y = y[start : start + target_len]
+            else:
+                y = np.pad(y, (0, target_len - len(y)))
+            return y.astype(np.float32)
+        except Exception:
+            pass
     try:
-        wav, _ = librosa.load(str(path), sr=sr, mono=True)
+        y, _ = librosa.load(str(path), sr=sr, mono=True)
     except Exception as e:
         print(f"  [audio error] {path}: {e}")
         return None
-    target = int(sr * clip_s)
-    if len(wav) >= target:
-        start = (len(wav) - target) // 2
-        wav = wav[start: start + target]
+    if len(y) < min_len:
+        return None
+    if len(y) >= target_len:
+        start = (len(y) - target_len) // 2
+        y = y[start : start + target_len]
     else:
-        wav = np.pad(wav, (0, target - len(wav)))
-    return wav.astype(np.float32)
+        y = np.pad(y, (0, target_len - len(y)))
+    return y.astype(np.float32)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -95,18 +118,33 @@ def load_audio(path: Path, sr: int = AUDIO_SR, clip_s: float = CLIP_SECONDS):
 
 @torch.no_grad()
 def encode_audio_batch(wavs, processor, model, device):
-    inputs = processor(audios=wavs, return_tensors="pt",
-                       sampling_rate=AUDIO_SR).to(device)
-    embs = model.get_audio_features(**inputs)
-    return F.normalize(embs, dim=-1).cpu()
+    inputs = processor(
+        audio=wavs,
+        return_tensors="pt",
+        sampling_rate=AUDIO_SR,
+    )
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    feat = model.get_audio_features(
+        input_features=inputs.get("input_features"),
+        is_longer=inputs.get("is_longer"),
+    )
+    return F.normalize(feat.pooler_output, dim=-1).cpu()
 
 
 @torch.no_grad()
 def encode_text_batch(texts, processor, model, device):
-    inputs = processor(text=texts, return_tensors="pt",
-                       padding=True, truncation=True).to(device)
-    embs = model.get_text_features(**inputs)
-    return F.normalize(embs, dim=-1).cpu()
+    inputs = processor(
+        text=texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+    )
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    feat = model.get_text_features(
+        input_ids=inputs.get("input_ids"),
+        attention_mask=inputs.get("attention_mask"),
+    )
+    return F.normalize(feat.pooler_output, dim=-1).cpu()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -207,14 +245,21 @@ def load_model(checkpoint, base_model, device):
         ckpt_path = Path(checkpoint)
         if not ckpt_path.exists():
             raise SystemExit(f"Checkpoint not found: {ckpt_path}")
-        state = torch.load(ckpt_path, map_location="cpu")
-        sd = state.get("model_state_dict", state.get("state_dict", state))
-        missing, _ = model.load_state_dict(sd, strict=False)
+        state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        sd = state.get(
+            "model_state",
+            state.get("model_state_dict", state.get("state_dict", state)),
+        )
+        inc = model.load_state_dict(sd, strict=False)
+        missing = list(getattr(inc, "missing_keys", ()))
+        unexpected = list(getattr(inc, "unexpected_keys", ()))
         if missing:
             print(f"  [warn] {len(missing)} missing keys in checkpoint")
+        if unexpected:
+            print(f"  [warn] {len(unexpected)} unexpected keys in checkpoint")
         print(f"  Loaded fine-tuned weights from {ckpt_path}")
     else:
-        print(f"  No checkpoint — evaluating base model (zero-shot)")
+        print(f"  No checkpoint - evaluating base model (zero-shot)")
     model.eval().to(device)
     return model, processor
 
@@ -232,7 +277,7 @@ def run_eval(model, processor, val_clips, clip_to_combo,
         sim_data: {strategy: {"pos": [...], "neg": [...]}}
     """
     # Encode audio
-    print(f"\n  Encoding {len(val_clips)} val audio clips…")
+    print(f"\n  Encoding {len(val_clips)} val audio clips ...")
     audio_embs, failed = [], []
     for i in range(0, len(val_clips), batch_size):
         batch_paths = val_clips[i: i + batch_size]
@@ -249,7 +294,7 @@ def run_eval(model, processor, val_clips, clip_to_combo,
             print(f"    {min(i + batch_size, len(val_clips))}/{len(val_clips)}", end="\r")
 
     if failed:
-        print(f"\n  [warn] {len(failed)} clips failed to load — excluded")
+        print(f"\n  [warn] {len(failed)} clips failed to load - excluded")
     valid_clips = [c for c in val_clips if c not in set(failed)]
     print(f"\n  Audio encoding done.")
     audio_matrix = torch.cat(audio_embs, dim=0).numpy()
@@ -266,10 +311,10 @@ def run_eval(model, processor, val_clips, clip_to_combo,
         eval_combos = [(c, q) for c, q in combo_queries.items()
                        if c in combo_to_indices and combo_to_indices[c]]
         if not eval_combos:
-            print(f"  [{strategy}] no valid combos — skipping")
+            print(f"  [{strategy}] no valid combos - skipping")
             continue
 
-        print(f"  [{strategy}] encoding {len(eval_combos)} queries…")
+        print(f"  [{strategy}] encoding {len(eval_combos)} queries ...")
         query_texts = [q for _, q in eval_combos]
         text_embs = []
         for i in range(0, len(query_texts), 64):
@@ -580,16 +625,16 @@ def generate_plots(all_results: dict, tax_db: dict, figures_dir: Path):
 
 def print_table(label, agg):
     strats = [s for s in STRATEGY_ORDER if s in agg]
-    print(f"\n{'─'*72}")
+    print(f"\n{'-'*72}")
     print(f"  {label}")
-    print(f"{'─'*72}")
+    print(f"{'-'*72}")
     print(f"  {'Strategy':<16} {'mAP':>7} {'MRR':>7} {'R@1':>7} {'R@5':>7} {'R@10':>7}  Queries")
-    print(f"  {'─'*68}")
+    print(f"  {'-'*68}")
     for s in strats:
         r = agg[s]
         print(f"  {s:<16} {r['mAP']:>7.3f} {r['MRR']:>7.3f} "
               f"{r['R@1']:>7.3f} {r['R@5']:>7.3f} {r['R@10']:>7.3f}  {r['n_queries']}")
-    print(f"{'─'*72}")
+    print(f"{'-'*72}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -620,11 +665,11 @@ def main():
     print(f"Device: {device}")
 
     # Load data
-    val_pairs  = json.loads(Path(args.val_pairs).read_text())
-    all_labels = json.loads(Path(args.labels).read_text())
-    tax_db     = json.loads(Path(args.taxonomy).read_text())
+    val_pairs  = json.loads(Path(args.val_pairs).read_text(encoding="utf-8"))
+    all_labels = json.loads(Path(args.labels).read_text(encoding="utf-8"))
+    tax_db     = json.loads(Path(args.taxonomy).read_text(encoding="utf-8"))
 
-    df       = pd.read_csv(args.metadata)
+    df       = pd.read_csv(args.metadata, encoding="utf-8")
     name_col = next((c for c in ("common_name", "species", "name") if c in df.columns), None)
     type_col = next((c for c in ("vocalization_type", "type") if c in df.columns), None)
     path_col = next((c for c in ("filepath", "file_path", "path", "filename") if c in df.columns), None)
@@ -661,19 +706,19 @@ def main():
         return {"agg": agg, "detail": detail, "sim_data": sim_data}
 
     if args.checkpoint:
-        print(f"\n{'═'*72}\n  Evaluating: fine-tuned  ({args.checkpoint})")
+        print(f"\n{'='*72}\n  Evaluating: fine-tuned  ({args.checkpoint})")
         all_results["finetuned"] = evaluate(args.checkpoint, f"Fine-tuned: {args.checkpoint}")
 
     if args.also_base or not args.checkpoint:
-        print(f"\n{'═'*72}\n  Evaluating: base model  ({args.model})")
+        print(f"\n{'='*72}\n  Evaluating: base model  ({args.model})")
         all_results["base"] = evaluate(None, f"Base model (zero-shot): {args.model}")
 
     # Delta table
     if "finetuned" in all_results and "base" in all_results:
-        print(f"\n{'═'*72}\n  Delta (fine-tuned − base)")
-        print(f"{'─'*72}")
-        print(f"  {'Strategy':<16} {'ΔmAP':>7} {'ΔMRR':>7} {'ΔR@1':>7} {'ΔR@5':>7} {'ΔR@10':>7}")
-        print(f"  {'─'*68}")
+        print(f"\n{'='*72}\n  Delta (fine-tuned - base)")
+        print(f"{'-'*72}")
+        print(f"  {'Strategy':<16} {'d mAP':>7} {'d MRR':>7} {'d R@1':>7} {'d R@5':>7} {'d R@10':>7}")
+        print(f"  {'-'*68}")
         for s in STRATEGY_ORDER:
             if s not in all_results["finetuned"]["agg"]: continue
             ft   = all_results["finetuned"]["agg"][s]
@@ -681,7 +726,7 @@ def main():
             def d(k): return ft[k] - base[k]
             print(f"  {s:<16} {d('mAP'):>+7.3f} {d('MRR'):>+7.3f} "
                   f"{d('R@1'):>+7.3f} {d('R@5'):>+7.3f} {d('R@10'):>+7.3f}")
-        print(f"{'─'*72}")
+        print(f"{'-'*72}")
 
     # Save JSON (exclude raw sim arrays to keep file small)
     out_path = Path(args.output)
@@ -692,18 +737,26 @@ def main():
             "agg":    v["agg"],
             "detail": v["detail"],   # per-combo metrics, no raw sims
         }
-    out_path.write_text(json.dumps({
-        "checkpoint":   args.checkpoint,
-        "base_model":   args.model,
-        "n_val_clips":  len(val_clips),
-        "n_val_combos": len(val_combos),
-        "results":      save_data,
-    }, indent=2))
-    print(f"\nResults saved → {out_path}")
+    out_path.write_text(
+        json.dumps(
+            {
+                "checkpoint": args.checkpoint,
+                "base_model": args.model,
+                "n_val_clips": len(val_clips),
+                "n_val_combos": len(val_combos),
+                "results": save_data,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+    print(f"\nResults saved -> {out_path}")
 
     # Generate plots
     if not args.no_plots:
-        print(f"\nGenerating plots → {args.figures_dir}/")
+        print(f"\nGenerating plots -> {args.figures_dir}/")
         generate_plots(all_results, tax_db, Path(args.figures_dir))
         print(f"All plots saved.")
 
