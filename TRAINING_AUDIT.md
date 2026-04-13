@@ -1,152 +1,187 @@
-# CLAP Fine-Tuning Audit Report
+# CLAP Fine-Tuning Audit — 1st Run
 
-**Date:** 2026-04-13  
-**Model:** `laion/clap-htsat-fused`  
-**Run:** 1st-run / lets-solve-it  
-
----
-
-## 1. Training Script (`scripts/train_clap.py`) — PASS
-
-| Component | Status | Notes |
-|-----------|--------|-------|
-| Loss function | PASS | Symmetric InfoNCE (CLIP-style). Correct for audio↔text contrastive alignment |
-| Embeddings | PASS | L2-normalised `pooler_output` from both towers, scaled by `model.logit_scale_a` |
-| Gradient accumulation | PASS | Loss divided by `accum_steps` before backward; optimizer only steps every 8 steps |
-| Mixed precision (AMP) | PASS | Correctly scoped with `GradScaler` and `autocast` |
-| Gradient clipping | PASS | `max_norm=1.0` — standard practice |
-| LR schedule | PASS | Cosine decay with linear warmup (200 steps). Appropriate for fine-tuning |
-| R@1 evaluation | PASS | Pools audio and text embeddings over 64 val batches, builds full similarity matrix, checks rank-1. Valid metric |
-| Data shuffling | PASS | Train loader uses `shuffle=True`; val loader does not |
-| Checkpoint saving | PASS | `best.pt` saved when val loss improves; `latest.pt` every epoch; per-epoch copies in `checkpoints/epochs/` |
-
-**No correctness bugs found in the training pipeline.**
+**Date paused:** 2026-04-13  
+**Run:** epochs 0–8 complete; epoch 9 interrupted at ~0%  
+**Model:** `laion/clap-htsat-fused` fine-tuned on Xeno-canto audio  
 
 ---
 
-## 2. Training Data Audit
-
-### Pair Counts
-
-| Dataset | Pairs | Unique audio files |
-|---------|-------|-------------------|
-| Train | 96,735 | 10,779 |
-| Val | 10,737 | 1,197 |
-
-### Split Quality
-
-| Check | Result |
-|-------|--------|
-| Audio overlap between train and val | **0** (clean split) |
-| Empty or very short texts (< 5 chars) | **0** |
-| Suspicious labels (null / unknown / placeholder) | **0** |
-| Duplicate (audio, text) pairs in train | **0** |
-
-### Text Variant Breakdown (per pair)
-
-| Type | Count | Description |
-|------|-------|-------------|
-| Short name only | ~21,548 | `"Canada Goose call"` |
-| Taxonomy path | ~21,558 | `"Animalia > ... > Branta canadensis call"` |
-| RAG rich narrative | ~42,711 | Multi-sentence audio descriptions |
-| Combined (name + scientific) | ~10,889 | `"Branta canadensis, Canada Goose call"` |
-| Other | ~29 | Edge cases |
-
-Each audio file has **5–9 text variants** (median 9). No audio file has fewer than 5. No exact (audio, text) duplicates.
-
-**Text length:** min 9 chars, max 241 chars, avg 102 chars. Well-formed.
-
-### Species Coverage
-
-| Metric | Value |
-|--------|-------|
-| Unique species in training set | ~1,941 |
-| Species with ≥ 10 recordings | 614 |
-| Species with only 1–2 recordings | 774 |
-| Top represented (by recording count) | Passerella iliaca (126), Setophaga coronata (90) |
-
----
-
-## 3. Known Data Issue — Narrative Text Duplication
-
-The RAG-generated rich descriptions (`generate_clap_descriptions.py`) are generated **per species**, not per recording. This means all recordings of the same species share the same set of narrative sentences.
-
-**Example:** All 27 Purple Finch recordings use the exact same 4 narrative descriptions:
-- *"Listen for the Purple Finch's song, a rich, slurred warble..."*
-- *"Discover the territory song of the male Purple Finch..."*
-- etc.
-
-**Measured impact:**
-- ~3,600 unique narrative sentences are each re-used across multiple recordings
-- ~1,092 taxonomy-path strings are also repeated (expected — same species, different recordings)
-
-**Effect on training:**
-- The contrastive loss can technically distinguish a species from all *other* species, but cannot distinguish *which recording* of that species matches a given narrative
-- Effective learning signal per epoch is lower than the raw pair count suggests
-- The model will generalise "species name ↔ species audio" well, but individual-recording-level retrieval will be weaker
-
-**Fix (for a future run):** Generate descriptions per recording using each XC file's individual metadata (behavior tag, location, date, recorder comments). This is a separate data pipeline task.
-
----
-
-## 4. Training Metrics Captured
-
-Only epoch 0 has a confirmed summary line in the log. Epochs 1–3 completed (checkpoints exist) but their summary lines were lost due to a PowerShell `Tee-Object` encoding issue (UTF-16 content appended to UTF-8 file). The issue has been fixed; future epoch summaries will be readable.
+## 1. Training Results Summary
 
 | Epoch | Train Loss | Val Loss | R@1 | Duration |
 |-------|-----------|---------|-----|---------|
-| 0 | 0.7159 | 1.8329 | 5.66% | ~3h 41m |
-| 1 | — (log corrupt) | — | — | — |
-| 2 | — (log corrupt) | — | — | — |
-| 3 | — (log corrupt) | — | — | — |
-| 4+ | In progress | — | — | — |
+| 00 | 0.7159 | 1.8329 | 5.66% | ~3h 41m |
+| 01–03 | not logged (log corruption) | — | — | — |
+| 04 | 0.0322 | 1.8652 | 7.81% | ~1h 58m |
+| 05 | 0.0235 | 1.8856 | 7.81% | ~2h 02m |
+| 06 | 0.0163 | 1.8645 | 7.03% | ~2h 01m |
+| 07 | 0.0255 | 1.8423 | 7.42% | ~2h 03m |
+| 08 | 0.0214 | 1.8358 | 7.42% | ~2h 53m |
 
-`best.pt` was saved after epoch 0 (val_loss 1.8329). If any of epochs 1–3 improved on this, `best.pt` was overwritten silently (no log line was captured).
-
----
-
-## 5. Epoch Prediction to Useful Model
-
-Based on dataset characteristics, model architecture, and epoch-0 metrics:
-
-| Epoch range | Expected behaviour |
-|-------------|-------------------|
-| 0–2 | Rapid early improvement; model adapts pretrained embeddings to bird domain |
-| 3–5 | Steady improvement; species-level discrimination developing |
-| 6–8 | Slower gains; plateau approaching; **model usable for retrieval** |
-| 9–10 | Final refinement; mild overfitting risk on rare species |
-
-**Predicted R@1 at epoch 10: 40–70%**
-
-The upper bound is capped by the narrative duplication issue (same text for all recordings of a species means the model cannot learn audio-specific features from text alone). Without that issue, the ceiling would be higher.
-
-**Minimum viable model:** ~7–8 epochs. At that point R@1 should exceed 50% and species-level audio↔text retrieval should work reliably for well-represented species.
+**Best checkpoint:** `best.pt` = end of epoch 0 (`val_loss=1.8329`)  
+**Latest checkpoint:** `checkpoints/epochs/epoch_08.pt`
 
 ---
 
-## 6. Hyperparameter Assessment
+## 2. What Actually Happened
 
-| Setting | Value | Assessment |
-|---------|-------|-----------|
-| Model | `laion/clap-htsat-fused` | Correct architecture for this task |
-| Batch size | 8 × accum 8 = eff. 64 | Reasonable for RTX 4070 (12 GB VRAM) |
-| Epochs | 10 | Sufficient given the dataset size |
-| LR | 5e-05 | Standard fine-tuning LR; not too aggressive |
-| Warmup | 200 steps | Appropriate for this dataset scale |
-| Workers | 4 (default) | Increase to 8 for better GPU utilisation |
-| Clip duration | 10 s | Matches CLAP pretraining default; appropriate |
+### Train loss fell sharply — that part worked
+The model learned the training data well:
+
+- Epoch 0 train loss: **0.7159** (still noisy from random weights)
+- Epoch 4 onward: **0.01–0.03** — the model can nearly perfectly predict training pairs
+
+This is expected and correct behavior. The learning signal exists and is flowing.
+
+### Val loss and R@1 hit a ceiling immediately
+- Epoch 0 val_loss: **1.8329** — best ever
+- Epoch 4–8 val_loss: **1.8358–1.8856** — never better than epoch 0
+- R@1: **5.66%** at epoch 0, hovers around **7%** later, never breaks 8%
+
+This is the red flag. The model trains fine but fails to generalize.
+
+### Diagnosis: the model learned the wrong thing
+The gap between train loss (~0.02) and val loss (~1.84) indicates the model is **memorizing patterns in training data** that don't transfer to the validation set. It learned shortcuts, not acoustic understanding.
 
 ---
 
-## 7. Recommendations for This Run
+## 3. Root Causes (most important first)
 
-1. **Continue to epoch 10.** The data and script are sound; let training complete.
-2. **Increase `--workers 8`** on next resume to reduce CPU bottleneck.
-3. **Check `best.pt` epoch** after training completes — it may be from epoch 1–3 (better than epoch 0) despite missing log lines.
+### A. Per-species text, not per-recording (critical)
 
-## 8. Recommendations for a Future Run (2nd-run)
+The RAG-generated rich descriptions in `data/clap_descriptions.json` are written **per species, not per recording**. Every XC clip of Purple Finch gets the exact same 4 narrative sentences.
 
-1. **Per-recording RAG descriptions** — generate narratives using each XC file's individual metadata tags. Biggest quality improvement available.
-2. **Pre-compute processor outputs** (mel spectrograms + tokenized text) to disk before training to remove the remaining CPU bottleneck entirely.
-3. **`--freeze-text-epochs 2`** — freeze the text encoder for the first 2 epochs so the audio encoder adapts first; can improve early training stability.
-4. **`persistent_workers=True` + higher `prefetch_factor`** in `DataLoader` for better GPU feed rate.
+**Effect:** The contrastive loss cannot distinguish between different recordings of the same species — the text targets are identical. Instead of learning "what makes this specific recording unique," the model learns "what text sounds like a Purple Finch." It overfits to species-level lexical cues and cannot generalize within-species at retrieval time.
+
+**Measured:** ~3,600 unique narrative sentences are each reused across multiple recordings. Some species-level sentences appear 27 times (once per recording of that species).
+
+### B. Low effective data diversity
+
+Despite 96,735 pairs:
+- 5 of the 9 text variants per clip are template-derived (name, sci-name, taxonomy chain, combined labels) — they carry nearly identical semantic information in different surface forms
+- True unique acoustic descriptions: close to 0 (all rich text is species-level)
+- Effective unique pairs: ~10,779 audio files × ~1–2 genuinely distinct text views = much less diversity than the pair count implies
+
+### C. Class imbalance
+
+- Top species: up to **126 recordings** (Passerella iliaca)
+- Bottom: **1–2 recordings** per species for ~774 species
+- Validation retrieval averages across all species/types. Well-represented species dominate training; rare species underfit.
+
+### D. Label noise from free-text vocalization types
+
+Vocalization type strings in XC metadata are user-contributed and inconsistent:
+- Fine-grained labels like "rolled flight call in flight" vs "flight call" vs "nocturnal flight call" overlap
+- Multi-label entries (e.g. "call, song") are split on first token, losing context
+- This creates ambiguous positives/negatives during retrieval eval
+
+### E. Val loss is not a great proxy for downstream quality
+
+The validation contrastive loss measures how well the model ranks a batch of pairs — not species-level retrieval across a gallery. R@1 on the eval harness (~8.8% at best) confirms the model is usable but weak.
+
+---
+
+## 4. Why This Run's Strategy Was Always Limited
+
+The contrastive objective assumes: **different clips have meaningfully different text**. When they don't (same species, same description), the model cannot learn what differentiates clips. It learns "Purple Finch text → Purple Finch audio" (species mapping) but not "this particular recording with a brighter opening note → this specific description." That species-mapping ability is already partially present in the base CLAP model, which is why `best.pt` (epoch 0, right at the start of fine-tuning) actually beat all later epochs on val loss — the pretrained model's species-level zero-shot ability was better than what this training reinforced.
+
+---
+
+## 5. Full Evaluation Results (from `results/eval_results.json`)
+
+Run: `evaluate_clap.py --checkpoint checkpoints/best.pt`  
+Val clips: 1195 | Strategy combos: 603
+
+| Strategy | mAP | MRR | R@1 | R@5 | R@10 |
+|---------|-----|-----|-----|-----|------|
+| common name | 0.196 | 0.265 | 7.5% | 25.3% | 35.5% |
+| scientific name | 0.173 | 0.243 | 6.8% | 20.5% | 31.5% |
+| taxonomy chain | 0.167 | 0.237 | 6.2% | 20.6% | 30.5% |
+| sci + common | **0.206** | **0.284** | **8.4%** | **25.2%** | **36.3%** |
+| chain + common | 0.195 | 0.266 | 7.2% | 25.0% | 37.0% |
+| rich description | 0.167 | 0.237 | 6.2% | 20.6% | 30.5% |
+
+Best query strategy: **scientific + common name combined**.  
+Rich descriptions perform no better than taxonomy chain — confirms the per-species text adds no retrieval signal.
+
+PDFs in `results/figures/`.
+
+---
+
+## 6. What to Fix in Run 2
+
+These are ordered by impact. The first two are non-negotiable.
+
+### Must fix
+
+**1. Per-recording text descriptions**  
+Re-run `generate_clap_descriptions.py` with **per-recording context** fed to the LLM:
+- XC recording ID, date, location, habitat, recorder notes
+- Behavior type from XC metadata (perched, in flight, alarm, dawn chorus, etc.)
+- Quality grade and any XC remarks
+
+Each recording should get a *unique* description. Even 1–2 sentences specific to that file is far more valuable than 4 shared sentences.
+
+**2. Remove or deduplicate repeated text targets**  
+When building pairs, if two recordings have identical rich text, assign only one of them the rich text and leave the other with taxonomy templates only. This prevents the model from learning "same text → different audio" shortcuts.
+
+### High value
+
+**3. Stratified sampling / rebalancing**  
+Cap species at ~15 recordings in training (oversample rare species up to ~5 minimum). This flattens the class distribution and forces the model to learn rare species better.
+
+**4. Hard negative mining (later epochs)**  
+After ~2 warm-up epochs, replace random negatives in each batch with "confusable" species (same family, similar call type). This forces the audio encoder to learn fine-grained distinctions, not just "bird vs. not-bird."
+
+**5. Freeze text encoder for first 2 epochs (`--freeze-text-epochs 2`)**  
+The text tower from CLAP is already strong. Freezing it early lets the audio encoder adapt without the text embeddings drifting. Unfreeze from epoch 3 onward.
+
+**6. Lower LR, longer warmup**  
+Current: LR=5e-5, warmup=200 steps. For a larger dataset with better diversity: LR=1e-5 or 2e-5, warmup=500 steps. Slower, more stable.
+
+### Nice to have
+
+**7. Clip-level metadata as additional text views**  
+Add text like `"recorded in British Columbia, June, mixed forest, male singing from exposed perch"` as an extra pair for each clip. No new data required, just XC metadata already in `xc_metadata_unified.csv`.
+
+**8. Larger effective batch size**  
+Contrastive learning benefits from more negatives per step. If VRAM allows, try batch=16, accum=4 (effective 64, same as now but more unique negatives per step). Or accumulate to 128.
+
+---
+
+## 7. Current Model — Is It Usable?
+
+Yes, for coarse species-level tasks:
+- **R@1 ~8%**, **R@10 ~36%** — weak for strict retrieval, but non-trivial
+- Species-name → audio matching works reasonably for well-represented species
+- Not suitable for fine-grained acoustic retrieval or audio captioning yet
+
+**Use as a baseline only.** Run 2 with better data should measurably exceed it.
+
+---
+
+## 8. Checkpoints Available
+
+| File | Epoch | Val Loss | R@1 |
+|------|-------|---------|-----|
+| `checkpoints/best.pt` | 0 | 1.8329 | 5.7% |
+| `checkpoints/latest.pt` | 8 | 1.8358 | 7.4% |
+| `checkpoints/epochs/epoch_03.pt` | 3 | ~unknown | — |
+| `checkpoints/epochs/epoch_08.pt` | 8 | 1.8358 | 7.4% |
+
+If starting a 2nd run, do **not** warm-start from these weights — the model learned shortcuts that will persist. Start from the base `laion/clap-htsat-fused` pretrained weights.
+
+---
+
+## 9. Resume State
+
+Training stopped after epoch 8 completes. Epoch 9 was killed at ~0% (no useful progress lost).
+
+If you want to continue this run to epoch 9:
+```powershell
+$env:PYTHONUTF8 = "1"; $env:PYTHONUNBUFFERED = "1"; $env:HF_HUB_DISABLE_SYMLINKS_WARNING = "1"
+"`n=== RESUMED $(Get-Date -Format o) ===`n" | Out-File training_run.log -Append -Encoding utf8
+.\.venv\Scripts\python.exe -u scripts\train_clap.py --resume checkpoints\latest.pt --workers 8 2>&1 | Out-File training_run.log -Append -Encoding utf8
+```
+
+**Recommendation:** Don't bother with epoch 9 here. Start run 2 with improved data instead.

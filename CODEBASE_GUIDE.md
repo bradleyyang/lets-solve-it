@@ -98,6 +98,9 @@ filepath,species_code,common_name,vocalization_type,quality_rating,duration,sour
 - **Multi-template label builder** (`build_clap_labels.py`) — 5 taxonomy templates + rich descriptions per `(species, type)`.
 - **Training pair builder** (`build_clap_training_pairs.py`) — 96 k train / 10 k val `(audio, text)` pairs.
 - **CLAP fine-tuning script** (`train_clap.py`) — symmetric InfoNCE loss, AMP, gradient accumulation, cosine LR, checkpointing, val R@1 metric.
+- **WAV pre-conversion path** (`convert_to_wav.py` + `train_clap.py` fast-path) — pre-clipped 48 kHz WAV siblings can be used to skip MP3 decode overhead.
+- **Evaluation harness** (`evaluate_clap.py`) — retrieval metrics + figures in `results/`.
+- **Run audit artifact** (`TRAINING_AUDIT.md`) — postmortem and run-2 recommendations.
 
 ### Not done (out of scope or future work)
 
@@ -106,6 +109,18 @@ filepath,species_code,common_name,vocalization_type,quality_rating,duration,sour
 - Evaluation harness / retrieval benchmark beyond R@1.
 - Multi-GPU / distributed training.
 - LoRA / PEFT (currently full fine-tune only).
+
+### Current fine-tune status (epoch 4-8 continuation)
+
+- Run reached epoch 8 successfully; epoch 9 was interrupted manually near start.
+- Epoch 4-8 metrics show very low train loss but flat validation quality:
+  - epoch 04: train 0.0322, val 1.8652, R@1 0.0781
+  - epoch 05: train 0.0235, val 1.8856, R@1 0.0781
+  - epoch 06: train 0.0163, val 1.8645, R@1 0.0703
+  - epoch 07: train 0.0255, val 1.8423, R@1 0.0742
+  - epoch 08: train 0.0214, val 1.8358, R@1 0.0742
+- Best `val_loss` for this run remains earlier (`best.pt`, epoch 00: 1.8329), indicating overfitting / weak generalization in later epochs.
+- Checkpoints are retained in `checkpoints/epochs/` (per-epoch snapshots) plus `best.pt` and `latest.pt`.
 
 ---
 
@@ -188,6 +203,14 @@ Jupyter: open `scripts/get_xenocanto.ipynb` or `scripts/eda_xc_metadata.ipynb` (
 
 - `requirements-ml.txt` pulls **PyTorch** and **transformers**; first CLAP run **downloads large weights**. CI without GPU should skip `--with-ml` or cache models.
 - CUDA is optional; CPU runs work but are slower.
+- On Windows, prefer UTF-8 logging for long runs (`PYTHONUTF8=1` and `Out-File -Encoding utf8`) to avoid mixed-encoding progress logs.
+
+### Why the current training quality is poor (important)
+
+- The richest text labels are generated **per species**, not per recording, so many different audio clips share identical rich descriptions.
+- Contrastive learning then learns species-level text shortcuts instead of clip-level acoustic distinctions.
+- Net result: train loss drops hard, but validation loss and retrieval metrics plateau (memorization > generalization).
+- See `TRAINING_AUDIT.md` for full evidence, metrics, and remediation plan.
 
 ### `filepath` format
 
@@ -213,12 +236,12 @@ Jupyter: open `scripts/get_xenocanto.ipynb` or `scripts/eda_xc_metadata.ipynb` (
 
 ## 8. Suggested next steps (prioritized)
 
-1. **Run 	rain_clap.py** end-to-end -- smoke test on 1 k pairs, then full corpus. Check val loss and R@1 curves for signs of overfitting or LR issues.
-2. **Evaluation harness** -- build a small held-out set of labeled retrieval queries; report R@1, R@5, and median rank so you can compare checkpoints.
-3. **Bird-only filtering** -- cnt:canada includes frogs, bats, and soundscapes. Add an explicit allowlist or taxonomy filter and re-run pair building.
-4. **LoRA / PEFT** -- if full fine-tune OOMs on the target GPU, add a --lora flag using peft library (small adapter weights, same base checkpoint).
-5. **Multi-GPU** -- wrap model in 	orch.nn.DataParallel or DistributedDataParallel for systems with more than one GPU.
-6. **Module split** -- move etch_xc_page / clean_to_unified_schema from notebook into scripts/xc_api.py to reduce notebook drift.
+1. **Regenerate rich descriptions per recording** (not per species) using clip-specific metadata (date/location/habitat/notes/behavior).
+2. **Deduplicate repeated text targets** in pair building so multiple clips do not share identical rich labels.
+3. **Rebalance species distribution** (cap dominant species, upsample rare species) before rebuilding train/val pairs.
+4. **Start run-2 from base pretrained CLAP**, not from current fine-tuned checkpoints (to avoid carrying over shortcut biases).
+5. **Tune optimization for stability** (lower LR, longer warmup, optional early text-encoder freeze).
+6. **Keep eval-first cadence**: after each epoch, compare mAP/MRR/R@K using `evaluate_clap.py`, not train loss alone.
 
 ---
 
