@@ -110,17 +110,19 @@ filepath,species_code,common_name,vocalization_type,quality_rating,duration,sour
 - Multi-GPU / distributed training.
 - LoRA / PEFT (currently full fine-tune only).
 
-### Current fine-tune status (epoch 4-8 continuation)
+### Current fine-tune status (epochs 4-9 completion)
 
-- Run reached epoch 8 successfully; epoch 9 was interrupted manually near start.
-- Epoch 4-8 metrics show very low train loss but flat validation quality:
+- Run reached epoch 9 and completed the configured 10-epoch schedule (00-09).
+- Epoch 4-9 metrics show very low train loss but flat validation quality:
   - epoch 04: train 0.0322, val 1.8652, R@1 0.0781
   - epoch 05: train 0.0235, val 1.8856, R@1 0.0781
   - epoch 06: train 0.0163, val 1.8645, R@1 0.0703
   - epoch 07: train 0.0255, val 1.8423, R@1 0.0742
   - epoch 08: train 0.0214, val 1.8358, R@1 0.0742
+  - epoch 09: train 0.0073, val 1.8330, R@1 0.0723
 - Best `val_loss` for this run remains earlier (`best.pt`, epoch 00: 1.8329), indicating overfitting / weak generalization in later epochs.
 - Checkpoints are retained in `checkpoints/epochs/` (per-epoch snapshots) plus `best.pt` and `latest.pt`.
+- Final eval artifacts for this completed run are in `results/eval_results_epoch09.json` and `results/figures_epoch09/`.
 
 ---
 

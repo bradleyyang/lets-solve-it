@@ -104,11 +104,14 @@ Evaluates retrieval performance on the held-out val set across 6 query strategie
 | `rich` | LLM-generated acoustic description |
 
 ```bash
-# Fine-tuned model only
-python scripts/evaluate_clap.py --checkpoint checkpoints/best.pt
+# Final run checkpoint (epoch 09)
+python scripts/evaluate_clap.py --checkpoint checkpoints/latest.pt
+
+# Evaluate a specific epoch snapshot
+python scripts/evaluate_clap.py --checkpoint checkpoints/epochs/epoch_09.pt
 
 # Fine-tuned vs base model (zero-shot baseline)
-python scripts/evaluate_clap.py --checkpoint checkpoints/best.pt --also-base
+python scripts/evaluate_clap.py --checkpoint checkpoints/latest.pt --also-base
 
 # Base model only (zero-shot)
 python scripts/evaluate_clap.py
@@ -131,5 +134,17 @@ python scripts/evaluate_clap.py
 | `similarity_distribution_{model}.pdf` | Positive vs negative cosine similarity distributions with Δμ |
 | `hardest_easiest_{model}.pdf` | Top 20 hardest and easiest species to retrieve |
 | `delta_finetuned_vs_base.pdf` | Per-strategy Δmetric (fine-tuned − base), only with `--also-base` |
+
+### Latest completed run (epochs 0-9)
+
+- Training reached the configured 10 epochs (00 through 09).
+- Best validation loss remained at epoch 00 (`best.pt`, 1.8329).
+- Final checkpoint (`latest.pt` / `epoch_09.pt`) achieved:
+  - train loss 0.0073
+  - val loss 1.8330
+  - R@1 0.0723
+- Final retrieval evaluation artifacts:
+  - `results/eval_results_epoch09.json`
+  - `results/figures_epoch09/`
 
 
