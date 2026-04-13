@@ -1,13 +1,17 @@
 """
 CLAP Training Pairs Builder
 ============================
-Converts audio metadata + clap_all_labels.json into the training JSON
-expected by LAION-CLAP and most CLAP fine-tuning frameworks.
+Converts audio metadata + clap_all_labels.json + clap_descriptions.json into
+the training JSON expected by LAION-CLAP and most CLAP fine-tuning frameworks.
 
-Each audio file is paired with ALL text variants from its label pool so
-the model learns every query form (name, taxonomy, acoustic description)
-for every clip. An audio with 9 label variants appears 9 times in the
-training data with a different text each time.
+Each audio file is paired with:
+  1. ALL taxonomy template variants from clap_all_labels.json (5 per clip)
+  2. Its own UNIQUE per-recording description from clap_descriptions.json (1 per clip)
+
+This means a clip with taxonomy + a rich description appears 6 times in
+training data, each with a different text. Crucially, the rich description is
+UNIQUE to that recording — two clips of the same species get different text —
+so the contrastive loss cannot shortcut by mapping identical text to many audios.
 
 Output format (LAION-CLAP compatible):
     data/clap_train_pairs.json   — list of {audio, text} dicts
@@ -17,13 +21,16 @@ Output format (LAION-CLAP compatible):
         {"audio": "audio/xc/1060250.mp3", "text": "American Robin song"},
         {"audio": "audio/xc/1060250.mp3", "text": "Turdus migratorius song"},
         {"audio": "audio/xc/1060250.mp3", "text": "Animalia > Chordata > Aves > ... song"},
+        {"audio": "audio/xc/1060250.mp3", "text": "Turdus migratorius, American Robin song"},
+        {"audio": "audio/xc/1060250.mp3", "text": "Animalia > ... > Turdus migratorius, American Robin song"},
+        {"audio": "audio/xc/1060250.mp3", "text": "American Robin singing its rich flute-like phrases..."},
         ...
     ]
 
 Balanced sampling: caps at MAX_PER_COMBO clips per (species, type) combo
 so common species don't dominate (follows AnimalCLAP's 30-clips-per-species
-per-epoch strategy). The cap applies to unique audio clips; each clip still
-generates one pair per text variant.
+strategy). The cap applies to unique audio clips; each clip still generates
+one pair per text variant.
 
 Usage:
     conda activate birdclap
@@ -41,6 +48,7 @@ import pandas as pd
 # ── paths ─────────────────────────────────────────────────────────────────────
 UNIFIED_META  = Path("data/xc_metadata_unified.csv")
 LABELS_PATH   = Path("data/clap_all_labels.json")
+REC_DESC_PATH = Path("data/clap_descriptions.json")   # per-recording descriptions
 TRAIN_OUT     = Path("data/clap_train_pairs.json")
 VAL_OUT       = Path("data/clap_val_pairs.json")
 
@@ -53,17 +61,18 @@ SKIP_TYPES = frozenset({"uncertain", "various", "various calls", "nan", ""})
 
 def build_pairs(metadata_paths: list[str],
                 labels: dict,
+                rec_descs: dict,
                 max_per_combo: int,
-                seed: int) -> list[dict]:
+                seed: int) -> tuple[list[dict], list[tuple[str, str]]]:
     """
-    For each audio file, look up its (species, voc_type) key in labels
-    and emit one {audio, text} pair per variant. Returns list of dicts.
+    For each audio file:
+      - Look up its (species, voc_type) key in labels → emit one pair per taxonomy template
+      - Look up its filepath in rec_descs → emit one pair for its unique per-recording description
 
-    The cap (max_per_combo) applies to unique audio clips per combo —
-    each accepted clip still produces len(labels[key]) pairs.
+    The cap (max_per_combo) applies to unique audio clips per combo.
+    Returns (all_pairs, accepted_clips).
     """
     rng = random.Random(seed)
-    # Collect accepted clips first: list of (fpath, key)
     accepted: list[tuple[str, str]] = []
     combo_counts: dict[str, int] = {}
 
@@ -74,7 +83,6 @@ def build_pairs(metadata_paths: list[str],
             continue
         df = pd.read_csv(p)
 
-        # Normalise column names
         name_col = next((c for c in ("common_name", "species", "name") if c in df.columns), None)
         type_col = next((c for c in ("vocalization_type", "type") if c in df.columns), None)
         path_col = next((c for c in ("filepath", "file_path", "path", "filename") if c in df.columns), None)
@@ -92,42 +100,47 @@ def build_pairs(metadata_paths: list[str],
             if name.lower() in SKIP_NAMES or not fpath or fpath == "nan":
                 continue
 
-            # Split multi-label types (e.g. "call, alarm call") — use first
             voc_type = voc_raw.split(",")[0].strip().lower()
             if voc_type in SKIP_TYPES:
                 continue
 
             key = f"{name}||{voc_type}"
             if key not in labels:
-                # Try with full raw type as fallback
                 key_full = f"{name}||{voc_raw.lower()}"
                 if key_full not in labels:
                     continue
                 key = key_full
 
-            # Balance: cap unique clips per combo
             combo_counts[key] = combo_counts.get(key, 0) + 1
             if combo_counts[key] > max_per_combo:
                 continue
 
             accepted.append((fpath, key))
 
-    # Shuffle clips before expanding to variants so train/val split is clip-level
     rng.shuffle(accepted)
 
-    # Expand each clip into one pair per text variant
+    # Expand: taxonomy templates + unique per-recording description (if available)
     all_pairs: list[dict] = []
+    n_with_desc = 0
     for fpath, key in accepted:
         for text in labels[key]:
             all_pairs.append({"audio": fpath, "text": text})
+        desc = rec_descs.get(fpath)
+        if desc:
+            all_pairs.append({"audio": fpath, "text": desc})
+            n_with_desc += 1
 
+    print(f"  Clips with per-recording description : {n_with_desc}/{len(accepted)} "
+          f"({100*n_with_desc/max(len(accepted),1):.1f}%)")
     return all_pairs, accepted
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--metadata", nargs="+", default=[str(UNIFIED_META)])
-    parser.add_argument("--labels",   default=str(LABELS_PATH))
+    parser.add_argument("--metadata",  nargs="+", default=[str(UNIFIED_META)])
+    parser.add_argument("--labels",    default=str(LABELS_PATH))
+    parser.add_argument("--rec-descs", default=str(REC_DESC_PATH),
+                        help="Per-recording descriptions JSON (from generate_clap_descriptions.py)")
     parser.add_argument("--train-out", default=str(TRAIN_OUT))
     parser.add_argument("--val-out",   default=str(VAL_OUT))
     parser.add_argument("--max-per-combo", type=int, default=30,
@@ -140,7 +153,15 @@ def main():
     labels = json.loads(Path(args.labels).read_text())
     print(f"Loaded {len(labels)} label keys from {args.labels}")
 
-    all_pairs, accepted_clips = build_pairs(args.metadata, labels, args.max_per_combo, args.seed)
+    rec_descs: dict = {}
+    rec_desc_path = Path(args.rec_descs)
+    if rec_desc_path.exists():
+        rec_descs = json.loads(rec_desc_path.read_text(encoding="utf-8"))
+        print(f"Loaded {len(rec_descs)} per-recording descriptions from {rec_desc_path}")
+    else:
+        print(f"No per-recording descriptions found at {rec_desc_path} — taxonomy templates only")
+
+    all_pairs, accepted_clips = build_pairs(args.metadata, labels, rec_descs, args.max_per_combo, args.seed)
 
     n_clips   = len(accepted_clips)
     n_val_clips = max(1, int(n_clips * args.val_split))

@@ -1,6 +1,6 @@
 """
-CLAP Label Builder (Taxonomy + Rich Descriptions)
-==================================================
+CLAP Label Builder (Taxonomy Templates)
+========================================
 Generates AnimalCLAP-style multi-template text labels for each unique
 (species, vocalization_type) combination.
 
@@ -11,8 +11,10 @@ Five taxonomy templates per the AnimalCLAP paper (ICASSP 2026):
   4. Scientific + common + voc_type  → "Turdus migratorius, American Robin song"
   5. Taxonomy + common + voc_type    → "Aves > ... > Turdus migratorius, American Robin song"
 
-If data/clap_descriptions.json exists (from generate_clap_descriptions.py),
-the RAG-generated rich descriptions are appended as additional variants.
+NOTE: Rich per-recording descriptions (from generate_clap_descriptions.py) are
+no longer appended here. They are keyed by recording filepath and added as
+individual pairs in build_clap_training_pairs.py. This ensures each audio clip
+gets a UNIQUE description rather than a shared per-species text.
 
 Taxonomy lookup uses GBIF Species API (free, no auth) with local caching so
 the network is only hit once per species.
@@ -26,8 +28,6 @@ Output:
             "Animalia > Chordata > Aves > Passeriformes > Turdidae > Turdus > Turdus migratorius song",
             "Turdus migratorius, American Robin song",
             "Animalia > Chordata > Aves > Passeriformes > Turdidae > Turdus > Turdus migratorius, American Robin song",
-            "American Robin singing its rich, melodic series of flute-like phrases...",
-            ...
         ],
         ...
     }
@@ -45,9 +45,8 @@ from pathlib import Path
 import pandas as pd
 
 # ── paths ────────────────────────────────────────────────────────────────────
-TAXONOMY_DB   = Path("data/species_taxonomy.json")   # built by build_taxonomy_db.py
-RICH_DESC_PATH= Path("data/clap_descriptions.json")
-OUT_PATH      = Path("data/clap_all_labels.json")
+TAXONOMY_DB = Path("data/species_taxonomy.json")   # built by build_taxonomy_db.py
+OUT_PATH    = Path("data/clap_all_labels.json")
 
 SKIP_TYPES    = {"uncertain", "various", "various calls", "nan", ""}
 SKIP_NAMES    = {"identity unknown", "soundscape", "noise", "speech",
@@ -129,20 +128,12 @@ def main():
     tax_db: dict = json.loads(TAXONOMY_DB.read_text(encoding="utf-8"))
     print(f"Loaded taxonomy for {len(tax_db)} species from {TAXONOMY_DB}")
 
-    # Load rich descriptions if available (from generate_clap_descriptions.py)
-    rich_descs: dict = {}
-    if RICH_DESC_PATH.exists():
-        rich_descs = json.loads(RICH_DESC_PATH.read_text(encoding="utf-8"))
-        print(f"Loaded {len(rich_descs)} rich description keys from {RICH_DESC_PATH}")
-    else:
-        print(f"No rich descriptions at {RICH_DESC_PATH} — taxonomy templates only")
-
     # Get all (species, vocalization_type) combos from metadata
     combos = get_combos(args.metadata)
     print(f"\nFound {len(combos)} unique (species, type) combos\n")
 
-    results  = {}
-    no_tax   = 0
+    results = {}
+    no_tax  = 0
 
     for i, (name, vtype) in enumerate(combos, 1):
         key = f"{name}||{vtype}"
@@ -151,12 +142,10 @@ def main():
         if not tax.get("scientific"):
             no_tax += 1
 
-        templates = build_templates(name, tax, vtype)
-        rich      = rich_descs.get(key, [])
-        results[key] = templates + rich
+        templates    = build_templates(name, tax, vtype)
+        results[key] = templates
 
-        status = f"{len(templates)} templates + {len(rich)} rich"
-        print(f"  [{i:4d}/{len(combos)}] {name} | {vtype}: {status}")
+        print(f"  [{i:4d}/{len(combos)}] {name} | {vtype}: {len(templates)} templates")
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -173,6 +162,8 @@ def main():
     counts = [len(v) for v in results.values()]
     if counts:
         print(f"  Variants/combo  : min={min(counts)}  max={max(counts)}  avg={sum(counts)/len(counts):.1f}")
+    print(f"\nNote: per-recording rich descriptions (clap_descriptions.json) are added")
+    print(f"      as individual pairs in build_clap_training_pairs.py, not here.")
     print(f"\nNext step:")
     print(f"  python scripts/build_clap_training_pairs.py --labels {out_path}")
 
