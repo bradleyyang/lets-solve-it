@@ -191,24 +191,33 @@ class ClapPairDataset(Dataset):
         audio = load_audio(self.root / pair["audio"], self.sr, self.clip_s)
         if audio is None:
             return None
-        return {"audio": audio, "text": pair["text"]}
+        return {
+            "audio":      audio,
+            "text":       pair["text"],
+            "combo":      pair.get("combo", ""),   # species||type — may be absent in old pair files
+            "audio_path": pair["audio"],
+        }
 
 
 def collate_fn(
     batch: list[dict[str, Any] | None],
     processor: ClapProcessor,
     sr: int,
-) -> dict[str, Tensor] | None:
+) -> dict[str, Any] | None:
     """
     Filters None items, calls ClapProcessor, returns CPU tensors (pin_memory-safe).
+    Non-tensor metadata (combos, audio_paths) is stored under the "meta" key so
+    batch_to_device can skip it.
     Returns None when the entire batch is empty (shouldn't happen in practice).
     """
     valid = [b for b in batch if b is not None]
     if not valid:
         return None
 
-    waveforms = [b["audio"] for b in valid]
-    texts     = [b["text"]  for b in valid]
+    waveforms = [b["audio"]      for b in valid]
+    texts     = [b["text"]       for b in valid]
+    combos    = [b["combo"]      for b in valid]
+    paths     = [b["audio_path"] for b in valid]
 
     inputs = processor(
         audio           = waveforms,
@@ -218,28 +227,66 @@ def collate_fn(
         padding         = True,
         truncation      = True,
     )
-    return {k: v for k, v in inputs.items()}
+    result = {k: v for k, v in inputs.items()}
+    result["meta"] = {"combos": combos, "audio_paths": paths}
+    return result
 
 
-def batch_to_device(batch: dict[str, Tensor], device: torch.device) -> dict[str, Tensor]:
-    return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+def batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    # Move tensors to device; leave non-tensor values (e.g. "meta" dict) as-is.
+    return {k: v.to(device, non_blocking=True) if isinstance(v, Tensor) else v
+            for k, v in batch.items()}
 
 
 # ── loss ───────────────────────────────────────────────────────────────────────
 
-def contrastive_loss(audio_emb: Tensor, text_emb: Tensor, log_scale: Tensor) -> Tensor:
+def contrastive_loss(
+    audio_emb: Tensor,
+    text_emb: Tensor,
+    log_scale: Tensor,
+    combos: list[str],
+    audio_paths: list[str],
+) -> Tensor:
     """
-    Symmetric InfoNCE (CLIP-style).
+    Multi-positive symmetric InfoNCE.
 
-    Both embeddings are assumed already L2-normalised (as returned by
-    ClapModel.get_audio_features / get_text_features pooler_output).
-    Diagonal elements are the positive pairs; off-diagonal are negatives.
+    Both embeddings are assumed already L2-normalised. Instead of treating only
+    the diagonal as positive (which causes false negatives when two clips from the
+    same species+type land in the same batch), we build a positive mask:
+
+      positive[i][j] = 1  if audio[i] and text[j] share the same audio file
+                           OR the same (species, type) combo
+
+    Soft cross-entropy with these targets avoids penalising the model for
+    correctly aligning clips that are genuinely interchangeable.
+
+    Falls back to standard diagonal loss when combo/path info is absent
+    (e.g. old pair files without the "combo" field).
     """
-    scale = log_scale.exp().clamp(max=100.0)
-    logits = scale * audio_emb @ text_emb.T          # (N, N)
-    labels = torch.arange(len(logits), device=logits.device)
-    loss_a = F.cross_entropy(logits,   labels)        # audio→text
-    loss_t = F.cross_entropy(logits.T, labels)        # text→audio
+    N = len(audio_emb)
+    scale  = log_scale.exp().clamp(max=100.0)
+    logits = scale * audio_emb @ text_emb.T   # (N, N)
+
+    # Fast path: no metadata → standard diagonal CLIP loss
+    if not combos or not any(combos):
+        labels = torch.arange(N, device=logits.device)
+        return (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2.0
+
+    # Build positive mask on CPU then move to device (small N, negligible cost)
+    mask = torch.zeros(N, N)
+    for i in range(N):
+        for j in range(N):
+            if audio_paths[i] == audio_paths[j]:   # same recording, different text variant
+                mask[i][j] = 1.0
+            elif combos[i] and combos[i] == combos[j]:  # same species+type, different clip
+                mask[i][j] = 1.0
+    mask = mask.to(logits.device)
+
+    # Normalise rows → soft targets that sum to 1
+    targets = mask / mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+
+    loss_a = -(targets   * F.log_softmax(logits,   dim=1)).sum(dim=1).mean()
+    loss_t = -(targets.T * F.log_softmax(logits.T, dim=1)).sum(dim=1).mean()
     return (loss_a + loss_t) / 2.0
 
 
@@ -255,39 +302,56 @@ def recall_at_1(
 ) -> float:
     """
     Audio→text R@1 on a subset of the validation loader.
-    Returns the fraction of queries whose correct text is ranked first.
+
+    A retrieval is counted correct if the top-ranked text comes from the same
+    (species, type) combo as the query audio — not just the exact paired row.
+    This avoids false negatives when two clips of the same species land in the
+    same evaluation window.
     """
     model.eval()
     audio_embs: list[Tensor] = []
     text_embs:  list[Tensor] = []
+    all_combos: list[str]    = []
 
     for i, batch in enumerate(loader):
         if i >= max_batches:
             break
         if batch is None:
             continue
-        batch = batch_to_device(batch, device)
+        combos = batch.get("meta", {}).get("combos", [])
+        batch  = batch_to_device(batch, device)
         with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
             a_feat = model.get_audio_features(
-                input_features  = batch.get("input_features"),
-                is_longer        = batch.get("is_longer"),
+                input_features = batch.get("input_features"),
+                is_longer      = batch.get("is_longer"),
             )
             t_feat = model.get_text_features(
-                input_ids       = batch.get("input_ids"),
-                attention_mask  = batch.get("attention_mask"),
+                input_ids      = batch.get("input_ids"),
+                attention_mask = batch.get("attention_mask"),
             )
         audio_embs.append(F.normalize(a_feat.pooler_output, dim=-1).cpu())
-        text_embs.append(F.normalize(t_feat.pooler_output, dim=-1).cpu())
+        text_embs.append(F.normalize(t_feat.pooler_output,  dim=-1).cpu())
+        all_combos.extend(combos)
 
     if not audio_embs:
         return 0.0
 
-    A = torch.cat(audio_embs)   # (N_total, D)
-    T = torch.cat(text_embs)    # (N_total, D)
-    sims = A @ T.T               # (N_total, N_total)
-    top1 = sims.argmax(dim=-1)
-    labels = torch.arange(len(top1))
-    return (top1 == labels).float().mean().item()
+    A    = torch.cat(audio_embs)    # (N, D)
+    T    = torch.cat(text_embs)     # (N, D)
+    sims = A @ T.T                  # (N, N)
+    top1 = sims.argmax(dim=-1)      # (N,) — index of highest-scoring text per audio
+
+    if all_combos and len(all_combos) == len(top1):
+        # Correct if top-ranked text shares the same combo as the query audio
+        correct = sum(
+            all_combos[top1[i].item()] == all_combos[i]
+            for i in range(len(top1))
+        )
+        return correct / len(top1)
+    else:
+        # Fallback for old pair files without combo info
+        labels = torch.arange(len(top1))
+        return (top1 == labels).float().mean().item()
 
 
 # ── checkpoint helpers ─────────────────────────────────────────────────────────
@@ -354,19 +418,23 @@ def train_one_epoch(
             continue
         batch = batch_to_device(batch, device)
 
+        meta   = batch.get("meta", {})
+        combos = meta.get("combos", [])
+        paths  = meta.get("audio_paths", [])
+
         with torch.autocast(device_type=device.type, enabled=use_amp):
             audio_feat = model.get_audio_features(
-                input_features  = batch.get("input_features"),
-                is_longer        = batch.get("is_longer"),
+                input_features = batch.get("input_features"),
+                is_longer      = batch.get("is_longer"),
             )
             text_feat = model.get_text_features(
-                input_ids       = batch.get("input_ids"),
-                attention_mask  = batch.get("attention_mask"),
+                input_ids      = batch.get("input_ids"),
+                attention_mask = batch.get("attention_mask"),
             )
 
             a_emb = F.normalize(audio_feat.pooler_output, dim=-1)
             t_emb = F.normalize(text_feat.pooler_output,  dim=-1)
-            loss  = contrastive_loss(a_emb, t_emb, model.logit_scale_a)
+            loss  = contrastive_loss(a_emb, t_emb, model.logit_scale_a, combos, paths)
             loss  = loss / accum_steps
 
         scaler.scale(loss).backward()
@@ -400,19 +468,22 @@ def validate(
     for batch in tqdm(loader, desc="val", unit="batch", dynamic_ncols=True):
         if batch is None:
             continue
-        batch = batch_to_device(batch, device)
+        meta   = batch.get("meta", {})
+        combos = meta.get("combos", [])
+        paths  = meta.get("audio_paths", [])
+        batch  = batch_to_device(batch, device)
         with torch.autocast(device_type=device.type, enabled=use_amp):
             audio_feat = model.get_audio_features(
-                input_features  = batch.get("input_features"),
-                is_longer        = batch.get("is_longer"),
+                input_features = batch.get("input_features"),
+                is_longer      = batch.get("is_longer"),
             )
             text_feat = model.get_text_features(
-                input_ids       = batch.get("input_ids"),
-                attention_mask  = batch.get("attention_mask"),
+                input_ids      = batch.get("input_ids"),
+                attention_mask = batch.get("attention_mask"),
             )
             a_emb = F.normalize(audio_feat.pooler_output, dim=-1)
             t_emb = F.normalize(text_feat.pooler_output,  dim=-1)
-            loss  = contrastive_loss(a_emb, t_emb, model.logit_scale_a)
+            loss  = contrastive_loss(a_emb, t_emb, model.logit_scale_a, combos, paths)
         total_loss += loss.item()
         n_batches  += 1
 

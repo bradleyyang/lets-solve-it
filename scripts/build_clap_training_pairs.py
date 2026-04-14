@@ -1,29 +1,24 @@
 """
 CLAP Training Pairs Builder
 ============================
-Converts audio metadata + clap_all_labels.json + clap_descriptions.json into
-the training JSON expected by LAION-CLAP and most CLAP fine-tuning frameworks.
+Converts audio metadata + clap_all_labels.json into the training JSON
+expected by LAION-CLAP and most CLAP fine-tuning frameworks.
 
-Each audio file is paired with:
-  1. ALL taxonomy template variants from clap_all_labels.json (5 per clip)
-  2. Its own UNIQUE per-recording description from clap_descriptions.json (1 per clip)
-
-This means a clip with taxonomy + a rich description appears 6 times in
-training data, each with a different text. Crucially, the rich description is
-UNIQUE to that recording — two clips of the same species get different text —
-so the contrastive loss cannot shortcut by mapping identical text to many audios.
+Each audio file is paired with ALL text variants from its label pool
+(5 taxonomy templates + up to 4 rich descriptions = ~9 variants per clip).
+Each pair also carries a "combo" field (species||type) so the training
+script can build a multi-positive mask — clips from the same combo are
+treated as joint positives, avoiding false negatives in the contrastive loss.
 
 Output format (LAION-CLAP compatible):
-    data/clap_train_pairs.json   — list of {audio, text} dicts
+    data/clap_train_pairs.json   — list of {audio, text, combo} dicts
     data/clap_val_pairs.json     — held-out 10% for validation
 
     [
-        {"audio": "audio/xc/1060250.mp3", "text": "American Robin song"},
-        {"audio": "audio/xc/1060250.mp3", "text": "Turdus migratorius song"},
-        {"audio": "audio/xc/1060250.mp3", "text": "Animalia > Chordata > Aves > ... song"},
-        {"audio": "audio/xc/1060250.mp3", "text": "Turdus migratorius, American Robin song"},
-        {"audio": "audio/xc/1060250.mp3", "text": "Animalia > ... > Turdus migratorius, American Robin song"},
-        {"audio": "audio/xc/1060250.mp3", "text": "American Robin singing its rich flute-like phrases..."},
+        {"audio": "audio/xc/1060250.mp3", "text": "American Robin song",          "combo": "American Robin||song"},
+        {"audio": "audio/xc/1060250.mp3", "text": "Turdus migratorius song",       "combo": "American Robin||song"},
+        {"audio": "audio/xc/1060250.mp3", "text": "Animalia > ... song",           "combo": "American Robin||song"},
+        {"audio": "audio/xc/1060250.mp3", "text": "A cheerful series of whistles", "combo": "American Robin||song"},
         ...
     ]
 
@@ -46,11 +41,10 @@ from pathlib import Path
 import pandas as pd
 
 # ── paths ─────────────────────────────────────────────────────────────────────
-UNIFIED_META  = Path("data/xc_metadata_unified.csv")
-LABELS_PATH   = Path("data/clap_all_labels.json")
-REC_DESC_PATH = Path("data/clap_descriptions.json")   # per-recording descriptions
-TRAIN_OUT     = Path("data/clap_train_pairs.json")
-VAL_OUT       = Path("data/clap_val_pairs.json")
+UNIFIED_META = Path("data/xc_metadata_unified.csv")
+LABELS_PATH  = Path("data/clap_all_labels.json")
+TRAIN_OUT    = Path("data/clap_train_pairs.json")
+VAL_OUT      = Path("data/clap_val_pairs.json")
 
 SKIP_NAMES = frozenset({
     "soundscape", "identity unknown", "noise", "speech", "canine", "squirrel",
@@ -61,13 +55,11 @@ SKIP_TYPES = frozenset({"uncertain", "various", "various calls", "nan", ""})
 
 def build_pairs(metadata_paths: list[str],
                 labels: dict,
-                rec_descs: dict,
                 max_per_combo: int,
                 seed: int) -> tuple[list[dict], list[tuple[str, str]]]:
     """
-    For each audio file:
-      - Look up its (species, voc_type) key in labels → emit one pair per taxonomy template
-      - Look up its filepath in rec_descs → emit one pair for its unique per-recording description
+    For each audio file, look up its (species, voc_type) key in labels and
+    emit one {audio, text, combo} pair per text variant.
 
     The cap (max_per_combo) applies to unique audio clips per combo.
     Returns (all_pairs, accepted_clips).
@@ -119,19 +111,14 @@ def build_pairs(metadata_paths: list[str],
 
     rng.shuffle(accepted)
 
-    # Expand: taxonomy templates + unique per-recording description (if available)
+    # Expand each clip into one pair per text variant.
+    # "combo" field lets train_clap.py build a multi-positive mask so clips
+    # from the same species+type are not penalised as negatives of each other.
     all_pairs: list[dict] = []
-    n_with_desc = 0
     for fpath, key in accepted:
         for text in labels[key]:
-            all_pairs.append({"audio": fpath, "text": text})
-        desc = rec_descs.get(fpath)
-        if desc:
-            all_pairs.append({"audio": fpath, "text": desc})
-            n_with_desc += 1
+            all_pairs.append({"audio": fpath, "text": text, "combo": key})
 
-    print(f"  Clips with per-recording description : {n_with_desc}/{len(accepted)} "
-          f"({100*n_with_desc/max(len(accepted),1):.1f}%)")
     return all_pairs, accepted
 
 
@@ -139,8 +126,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--metadata",  nargs="+", default=[str(UNIFIED_META)])
     parser.add_argument("--labels",    default=str(LABELS_PATH))
-    parser.add_argument("--rec-descs", default=str(REC_DESC_PATH),
-                        help="Per-recording descriptions JSON (from generate_clap_descriptions.py)")
     parser.add_argument("--train-out", default=str(TRAIN_OUT))
     parser.add_argument("--val-out",   default=str(VAL_OUT))
     parser.add_argument("--max-per-combo", type=int, default=30,
@@ -153,15 +138,7 @@ def main():
     labels = json.loads(Path(args.labels).read_text())
     print(f"Loaded {len(labels)} label keys from {args.labels}")
 
-    rec_descs: dict = {}
-    rec_desc_path = Path(args.rec_descs)
-    if rec_desc_path.exists():
-        rec_descs = json.loads(rec_desc_path.read_text(encoding="utf-8"))
-        print(f"Loaded {len(rec_descs)} per-recording descriptions from {rec_desc_path}")
-    else:
-        print(f"No per-recording descriptions found at {rec_desc_path} — taxonomy templates only")
-
-    all_pairs, accepted_clips = build_pairs(args.metadata, labels, rec_descs, args.max_per_combo, args.seed)
+    all_pairs, accepted_clips = build_pairs(args.metadata, labels, args.max_per_combo, args.seed)
 
     n_clips   = len(accepted_clips)
     n_val_clips = max(1, int(n_clips * args.val_split))
