@@ -524,13 +524,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--epochs",       type=int,   default=10,    help="Training epochs (default 10)")
     ap.add_argument("--batch-size",   type=int,   default=8,     help="Per-GPU batch size (default 8)")
     ap.add_argument("--accum",        type=int,   default=8,     help="Gradient accumulation steps (default 8 → effective batch 64)")
-    ap.add_argument("--lr",           type=float, default=5e-5,  help="Peak learning rate (default 5e-5)")
-    ap.add_argument("--warmup-steps", type=int,   default=200,   help="LR warmup steps (default 200)")
+    ap.add_argument("--lr",           type=float, default=2e-5,  help="Peak learning rate (default 2e-5)")
+    ap.add_argument("--warmup-steps", type=int,   default=500,   help="LR warmup steps (default 500)")
     ap.add_argument("--workers",      type=int,   default=4,     help="DataLoader worker processes (default 4)")
     ap.add_argument("--clip-s",       type=float, default=CLIP_DURATION_S, help="Audio clip length in seconds (default 10.0)")
     ap.add_argument(
-        "--freeze-text-epochs", type=int, default=0,
-        help="Freeze the text encoder for this many epochs at the start (default 0 = never freeze)",
+        "--freeze-text-epochs", type=int, default=2,
+        help="Freeze the text encoder for this many epochs at the start (default 2)",
     )
     ap.add_argument(
         "--no-amp", action="store_true",
@@ -612,7 +612,7 @@ def main(argv: list[str] | None = None) -> int:
     val_loader = DataLoader(
         val_ds,
         batch_size  = args.batch_size,
-        shuffle     = False,
+        shuffle     = True,
         num_workers = args.workers,
         collate_fn  = _collate,
         pin_memory  = (device.type == "cuda"),
