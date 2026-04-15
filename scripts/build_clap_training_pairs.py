@@ -65,6 +65,7 @@ def build_pairs(metadata_paths: list[str],
                 tax_db: dict,
                 max_per_combo: int,
                 min_clips_per_combo: int,
+                top_n_species: int | None,
                 seed: int) -> tuple[list[dict], list[tuple[str, str]]]:
     """
     For each audio file, look up its (species, voc_type) key in labels and
@@ -72,6 +73,7 @@ def build_pairs(metadata_paths: list[str],
 
     Filters:
       - Birds only: species whose taxonomic class != 'Aves' are skipped.
+      - top_n_species: if set, only keep the N species with the most clips.
       - min_clips_per_combo: combos with fewer unique clips are dropped after
         the first pass (they add no multi-positive signal).
       - max_per_combo cap: applied per combo to limit class imbalance.
@@ -79,6 +81,21 @@ def build_pairs(metadata_paths: list[str],
     Returns (all_pairs, accepted_clips).
     """
     rng = random.Random(seed)
+
+    # Pre-compute top-N species set if requested
+    top_species: set[str] | None = None
+    if top_n_species:
+        for path in metadata_paths:
+            p = Path(path)
+            if not p.exists():
+                continue
+            df = pd.read_csv(p)
+            name_col = next((c for c in ("common_name", "species", "name") if c in df.columns), None)
+            if not name_col:
+                continue
+            counts = df[name_col].value_counts()
+            top_species = set(counts.head(top_n_species).index.tolist())
+        print(f"  Top-{top_n_species} species filter active ({len(top_species)} species)")
 
     # First pass: collect all valid clips per combo (respecting cap)
     combo_clips: dict[str, list[str]] = {}
@@ -110,6 +127,10 @@ def build_pairs(metadata_paths: list[str],
             # Birds only
             tax_class = tax_db.get(name, {}).get("class", "")
             if tax_class and tax_class != "Aves":
+                continue
+
+            # Top-N species filter
+            if top_species is not None and name not in top_species:
                 continue
 
             voc_type = voc_raw.split(",")[0].strip().lower()
@@ -163,6 +184,8 @@ def main():
                         help="Max audio clips per (species, type) combo (default 50)")
     parser.add_argument("--min-clips-per-combo", type=int, default=MIN_CLIPS_PER_COMBO,
                         help=f"Drop combos with fewer than this many clips (default {MIN_CLIPS_PER_COMBO})")
+    parser.add_argument("--top-n-species", type=int, default=None,
+                        help="Only include the N species with the most clips (default: all)")
     parser.add_argument("--val-split", type=float, default=0.1,
                         help="Fraction of clips held out for validation (default 0.1)")
     parser.add_argument("--seed", type=int, default=42)
@@ -181,7 +204,7 @@ def main():
 
     all_pairs, accepted_clips = build_pairs(
         args.metadata, labels, tax_db,
-        args.max_per_combo, args.min_clips_per_combo, args.seed,
+        args.max_per_combo, args.min_clips_per_combo, args.top_n_species, args.seed,
     )
 
     n_clips   = len(accepted_clips)
