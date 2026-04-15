@@ -56,6 +56,7 @@ SKIP_TYPES    = {"uncertain", "various", "various calls", "nan", ""}
 SKIP_NAMES    = {"identity unknown", "soundscape", "noise", "speech",
                  "canine", "squirrel", "insects", "rooster", "other",
                  "background", "unknown", "nan", ""}
+BIRD_CLASS    = "Aves"   # only generate labels for birds
 
 
 # ── label template builder ────────────────────────────────────────────────────
@@ -107,9 +108,11 @@ def get_combos(metadata_paths: list[str]) -> list[tuple[str, str]]:
             continue
         for _, row in df.iterrows():
             name = str(row[name_col]).strip()
+            if not name or name.lower() in SKIP_NAMES:
+                continue
             for t in str(row[type_col]).split(","):
                 t = t.strip().lower()
-                if t not in SKIP_TYPES and name and name.lower() not in SKIP_NAMES:
+                if t not in SKIP_TYPES:
                     combos.add((name, t))
     return sorted(combos)
 
@@ -147,9 +150,16 @@ def main():
     results = {}
     no_tax  = 0
 
+    skipped_non_bird = 0
     for i, (name, vtype) in enumerate(combos, 1):
         key = f"{name}||{vtype}"
         tax = tax_db.get(name, {})
+
+        # Skip non-bird species (mammals, amphibians, insects, unknowns)
+        tax_class = tax.get("class", "")
+        if tax_class and tax_class != BIRD_CLASS:
+            skipped_non_bird += 1
+            continue
 
         if not tax.get("scientific"):
             no_tax += 1
@@ -172,6 +182,7 @@ def main():
     print(f"\n{'-'*60}")
     print(f"Done.")
     print(f"  Labels written  : {len(results)} (species, type) pairs -> {out_path}")
+    print(f"  Skipped non-bird: {skipped_non_bird} combos (class != Aves)")
     print(f"  No taxonomy     : {no_tax} species (common name only template)")
     counts = [len(v) for v in results.values()]
     if counts:
