@@ -104,6 +104,9 @@ Evaluates retrieval performance on the held-out val set across 6 query strategie
 | `rich` | LLM-generated acoustic description |
 
 ```bash
+# Second fine-tune best checkpoint (recommended)
+python scripts/evaluate_clap.py --checkpoint checkpoints/second-fine-tune/best.pt --metadata scripts/xc_metadata_unified.csv --audio-root scripts/data/xc_audio
+
 # Final run checkpoint (epoch 09)
 python scripts/evaluate_clap.py --checkpoint checkpoints/latest.pt
 
@@ -135,16 +138,18 @@ python scripts/evaluate_clap.py
 | `hardest_easiest_{model}.pdf` | Top 20 hardest and easiest species to retrieve |
 | `delta_finetuned_vs_base.pdf` | Per-strategy Δmetric (fine-tuned − base), only with `--also-base` |
 
-### Latest completed run (epochs 0-9)
+### Latest completed run (second fine-tune, epochs 0-9)
 
-- Training reached the configured 10 epochs (00 through 09).
-- Best validation loss remained at epoch 00 (`best.pt`, 1.8329).
-- Final checkpoint (`latest.pt` / `epoch_09.pt`) achieved:
-  - train loss 0.0073
-  - val loss 1.8330
-  - R@1 0.0723
-- Final retrieval evaluation artifacts:
-  - `results/eval_results_epoch09.json`
-  - `results/figures_epoch09/`
+- Training reached the configured 10 epochs (00 through 09) in `checkpoints/second-fine-tune/`.
+- Best validation loss: epoch 07 (`checkpoints/second-fine-tune/best.pt`, `val_loss=0.6520`).
+- Final checkpoint (`checkpoints/second-fine-tune/latest.pt`) at epoch 09:
+  - train loss 0.0321
+  - val loss 0.6736
+  - R@1 0.4471
+- Fresh retrieval evaluation artifacts (best checkpoint vs base):
+  - `results/eval_results_second_fine_tune_best.json`
+  - `results/figures_second_fine_tune_best/`
+- Dedicated audit document:
+  - `TRAINING_AUDIT_SECOND_FINE_TUNE.md`
 
 

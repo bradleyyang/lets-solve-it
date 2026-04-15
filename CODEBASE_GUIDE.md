@@ -110,19 +110,20 @@ filepath,species_code,common_name,vocalization_type,quality_rating,duration,sour
 - Multi-GPU / distributed training.
 - LoRA / PEFT (currently full fine-tune only).
 
-### Current fine-tune status (epochs 4-9 completion)
+### Current fine-tune status (second fine-tune completed)
 
-- Run reached epoch 9 and completed the configured 10-epoch schedule (00-09).
-- Epoch 4-9 metrics show very low train loss but flat validation quality:
-  - epoch 04: train 0.0322, val 1.8652, R@1 0.0781
-  - epoch 05: train 0.0235, val 1.8856, R@1 0.0781
-  - epoch 06: train 0.0163, val 1.8645, R@1 0.0703
-  - epoch 07: train 0.0255, val 1.8423, R@1 0.0742
-  - epoch 08: train 0.0214, val 1.8358, R@1 0.0742
-  - epoch 09: train 0.0073, val 1.8330, R@1 0.0723
-- Best `val_loss` for this run remains earlier (`best.pt`, epoch 00: 1.8329), indicating overfitting / weak generalization in later epochs.
-- Checkpoints are retained in `checkpoints/epochs/` (per-epoch snapshots) plus `best.pt` and `latest.pt`.
-- Final eval artifacts for this completed run are in `results/eval_results_epoch09.json` and `results/figures_epoch09/`.
+- A second fine-tune run completed 10 epochs (00-09) in `checkpoints/second-fine-tune/`.
+- Training curve highlights:
+  - epoch 02: train 0.3773, val 0.6744, R@1 0.3320
+  - epoch 07: train 0.0200, val **0.6520**, R@1 0.4501 (best val checkpoint)
+  - epoch 09: train 0.0321, val 0.6736, R@1 0.4471 (latest checkpoint)
+- Best checkpoint: `checkpoints/second-fine-tune/best.pt` (epoch 07).
+- Latest checkpoint: `checkpoints/second-fine-tune/latest.pt` (epoch 09).
+- Fresh retrieval eval (best checkpoint vs base model) is in:
+  - `results/eval_results_second_fine_tune_best.json`
+  - `results/figures_second_fine_tune_best/`
+- Run audit is documented in:
+  - `TRAINING_AUDIT_SECOND_FINE_TUNE.md`
 
 ---
 
