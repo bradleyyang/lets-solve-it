@@ -51,8 +51,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -83,6 +85,15 @@ MIN_DURATION_S   = 0.5             # recordings shorter than this are skipped
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
+
+
+def default_workers() -> int:
+    """
+    Conservative worker default for Windows + 16 GB RAM systems.
+    Keeps enough parallelism for throughput while avoiding host-memory spikes.
+    """
+    cpu_count = os.cpu_count() or 6
+    return max(2, min(6, cpu_count // 2))
 
 
 def load_audio(path: Path, sr: int = TARGET_SR, clip_s: float = CLIP_DURATION_S) -> np.ndarray | None:
@@ -197,6 +208,100 @@ class ClapPairDataset(Dataset):
             "combo":      pair.get("combo", ""),   # species||type — may be absent in old pair files
             "audio_path": pair["audio"],
         }
+
+
+class ClapPrecomputedDataset(Dataset):
+    """
+    Fast variant of ClapPairDataset that loads pre-computed mel-spectrogram
+    tensors (.clap.pt sidecars) instead of raw waveforms.
+
+    Run scripts/precompute_clap_features.py once to generate the sidecars.
+    Each sidecar contains {"input_features": Tensor, "is_longer": Tensor}
+    as saved by ClapFeatureExtractor with batch_size=1.
+
+    Reduces per-batch CPU cost from ~14 s (ClapProcessor on 8 samples) to
+    ~0.1 s (torch.load + RobertaTokenizer).
+    """
+
+    def __init__(
+        self,
+        pairs_path: Path,
+        audio_root: Path,
+        verbose: bool = True,
+    ) -> None:
+        raw: list[dict[str, str]] = json.loads(
+            pairs_path.read_text(encoding="utf-8")
+        )
+        self.root = audio_root
+        self.pairs: list[dict[str, str]] = []
+        missing = 0
+        for p in raw:
+            clap_pt = (audio_root / p["audio"]).with_suffix(".clap.pt")
+            if clap_pt.is_file():
+                self.pairs.append(p)
+            else:
+                missing += 1
+        if verbose:
+            print(
+                f"  [{pairs_path.name}]  {len(self.pairs):,} pre-computed pairs "
+                f"({missing:,} skipped — .clap.pt not found)"
+            )
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, idx: int) -> dict[str, Any] | None:
+        pair    = self.pairs[idx]
+        clap_pt = (self.root / pair["audio"]).with_suffix(".clap.pt")
+        try:
+            feat = torch.load(str(clap_pt), map_location="cpu", weights_only=True)
+        except Exception:
+            return None
+        return {
+            # keep the batch dim (1, …) — collate_precomputed_fn cats along dim 0
+            "input_features": feat["input_features"],
+            "is_longer":      feat["is_longer"],
+            "text":       pair["text"],
+            "combo":      pair.get("combo", ""),
+            "audio_path": pair["audio"],
+        }
+
+
+def collate_precomputed_fn(
+    batch: list[dict[str, Any] | None],
+    tokenizer: Any,
+) -> dict[str, Any] | None:
+    """
+    Collate for ClapPrecomputedDataset.
+
+    Stacks pre-computed audio tensors and tokenises text on-the-fly (fast).
+    Produces the same dict structure as collate_fn so the rest of the
+    training loop is unchanged.
+    """
+    valid = [b for b in batch if b is not None]
+    if not valid:
+        return None
+
+    input_features = torch.cat([b["input_features"] for b in valid], dim=0)
+    is_longer      = torch.cat([b["is_longer"]      for b in valid], dim=0)
+    texts          = [b["text"]       for b in valid]
+    combos         = [b["combo"]      for b in valid]
+    paths          = [b["audio_path"] for b in valid]
+
+    text_enc = tokenizer(
+        texts,
+        return_tensors = "pt",
+        padding        = True,
+        truncation     = True,
+    )
+
+    return {
+        "input_features": input_features,
+        "is_longer":      is_longer,
+        "input_ids":      text_enc["input_ids"],
+        "attention_mask": text_enc["attention_mask"],
+        "meta": {"combos": combos, "audio_paths": paths},
+    }
 
 
 def collate_fn(
@@ -490,6 +595,82 @@ def validate(
     return total_loss / max(n_batches, 1)
 
 
+# ── cache warming ─────────────────────────────────────────────────────────────
+
+def warm_file_cache(
+    train_ds: "ClapPairDataset",
+    val_ds: "ClapPairDataset",
+    workers: int = 4,
+) -> None:
+    """
+    Read every unique WAV (or MP3) file in the training and validation datasets
+    into the OS page cache before the first epoch begins.
+
+    On a 16 GB system the full ~8.9 GB of WAV siblings fits in RAM.  After this
+    pass every subsequent DataLoader read is served from memory at ~20 GB/s
+    instead of from disk at ~500 MB/s, making epoch 1 as fast as epoch 9.
+
+    Uses a thread pool for parallel I/O (I/O-bound, so threads are fine).
+    Skips files that cannot be opened rather than aborting training.
+    """
+    # Collect unique file paths.
+    # ClapPrecomputedDataset → warm the .clap.pt sidecars.
+    # ClapPairDataset        → warm the .wav siblings (or .mp3 fallback).
+    seen: set[Path] = set()
+    for ds in (train_ds, val_ds):
+        for pair in ds.pairs:
+            base   = ds.root / pair["audio"]
+            clap_pt = base.with_suffix(".clap.pt")
+            wav     = base.with_suffix(".wav")
+            if clap_pt.is_file():
+                seen.add(clap_pt)
+            elif wav.is_file():
+                seen.add(wav)
+            else:
+                seen.add(base)
+
+    paths = sorted(seen)
+    total_files = len(paths)
+    total_mb    = sum(p.stat().st_size for p in paths if p.exists()) / 1024 ** 2
+
+    print(
+        f"\nWarming OS page cache: {total_files:,} unique files  "
+        f"({total_mb / 1024:.2f} GB) ..."
+    )
+
+    n_ok = n_err = 0
+    bytes_read = 0
+
+    def _read(p: Path) -> int:
+        return len(p.read_bytes())
+
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futs = {pool.submit(_read, p): p for p in paths}
+        pbar = tqdm(
+            as_completed(futs),
+            total=total_files,
+            desc="cache warm",
+            unit="file",
+            dynamic_ncols=True,
+        )
+        for fut in pbar:
+            try:
+                bytes_read += fut.result()
+                n_ok += 1
+            except Exception:
+                n_err += 1
+            pbar.set_postfix(ok=n_ok, err=n_err, mb=f"{bytes_read/1024**2:.0f}")
+
+    elapsed = time.time() - t0
+    speed   = bytes_read / 1024 ** 2 / max(elapsed, 1e-3)
+    print(
+        f"Cache warm done: {n_ok:,} files read  ({bytes_read/1024**3:.2f} GB)  "
+        f"{speed:.0f} MB/s  ({elapsed:.1f}s)"
+        + (f"  [{n_err} errors]" if n_err else "")
+    )
+
+
 # ── argument parsing ───────────────────────────────────────────────────────────
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -523,14 +704,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     ap.add_argument("--epochs",       type=int,   default=10,    help="Training epochs (default 10)")
     ap.add_argument("--batch-size",   type=int,   default=8,     help="Per-GPU batch size (default 8)")
-    ap.add_argument("--accum",        type=int,   default=16,    help="Gradient accumulation steps (default 16 → effective batch 128)")
+    ap.add_argument("--accum",        type=int,   default=8,     help="Gradient accumulation steps (default 8 -> effective batch 64)")
     ap.add_argument("--lr",           type=float, default=2e-5,  help="Peak learning rate (default 2e-5)")
-    ap.add_argument("--warmup-steps", type=int,   default=500,   help="LR warmup steps (default 500)")
-    ap.add_argument("--workers",      type=int,   default=4,     help="DataLoader worker processes (default 4)")
+    ap.add_argument("--warmup-steps", type=int,   default=200,   help="LR warmup steps (default 200)")
+    ap.add_argument("--workers",      type=int,   default=default_workers(), help="DataLoader worker processes (default auto)")
+    ap.add_argument("--prefetch-factor", type=int, default=2,    help="DataLoader prefetch factor when workers > 0 (default 2)")
     ap.add_argument("--clip-s",       type=float, default=CLIP_DURATION_S, help="Audio clip length in seconds (default 10.0)")
     ap.add_argument(
-        "--freeze-text-epochs", type=int, default=2,
-        help="Freeze the text encoder for this many epochs at the start (default 2)",
+        "--freeze-text-epochs", type=int, default=1,
+        help="Freeze the text encoder for this many epochs at the start (default 1)",
     )
     ap.add_argument(
         "--no-amp", action="store_true",
@@ -553,6 +735,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument(
         "--seed", type=int, default=42,
         help="Random seed (default 42)",
+    )
+    ap.add_argument(
+        "--no-persistent-workers",
+        action="store_true",
+        help="Disable DataLoader persistent workers (enabled by default when workers > 0)",
+    )
+    ap.add_argument(
+        "--no-cache-warm",
+        action="store_true",
+        help="Skip the OS page-cache warming pass before epoch 0 (not recommended on cold starts)",
+    )
+    ap.add_argument(
+        "--no-precomputed",
+        action="store_true",
+        help="Force raw-audio path even if .clap.pt sidecars exist (for debugging)",
     )
     return ap.parse_args(argv)
 
@@ -578,12 +775,23 @@ def main(argv: list[str] | None = None) -> int:
 
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp   = (not args.no_amp) and (device.type == "cuda")
+    if device.type == "cuda":
+        # Throughput-focused defaults for Ampere/Ada cards such as RTX 4070.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
 
     print(f"Device:       {device}  (AMP {'on' if use_amp else 'off'})")
     print(f"Model:        {args.model}")
     print(f"Audio root:   {args.audio_root}")
     print(f"Batch size:   {args.batch_size}  x  accum {args.accum}  =  effective {args.batch_size * args.accum}")
     print(f"Epochs:       {args.epochs}  |  LR: {args.lr}  |  warmup: {args.warmup_steps}")
+    print(
+        f"Workers:      {args.workers}  |  prefetch: {args.prefetch_factor}  |  "
+        f"persistent: {'off' if args.no_persistent_workers else 'on'}"
+    )
+    print(f"Data path:    {'pre-computed .clap.pt (fast)' if not args.no_precomputed else 'raw audio (slow)'}")
 
     # ── processor + model ─────────────────────────────────────────────────────
     print("\nLoading processor and model weights ...")
@@ -594,11 +802,48 @@ def main(argv: list[str] | None = None) -> int:
     # ── datasets ──────────────────────────────────────────────────────────────
     audio_root = Path(args.audio_root)
     print("\nBuilding datasets ...")
-    train_ds = ClapPairDataset(Path(args.train_pairs), audio_root, clip_s=args.clip_s)
-    val_ds   = ClapPairDataset(Path(args.val_pairs),   audio_root, clip_s=args.clip_s)
 
-    # Must be picklable on Windows (spawn): no lambda; partial of module-level collate_fn.
-    _collate = partial(collate_fn, processor=processor, sr=TARGET_SR)
+    # Auto-detect whether pre-computed .clap.pt sidecars are available.
+    # If ≥ 95 % of training pairs have a sidecar, use the fast pre-computed
+    # path (ClapPrecomputedDataset + collate_precomputed_fn) which reduces
+    # per-batch CPU cost from ~14 s to ~0.1 s.  Fall back to the raw-audio
+    # path (ClapPairDataset + collate_fn) otherwise.
+    use_precomputed = False
+    if not args.no_precomputed:
+        pre_train = ClapPrecomputedDataset(Path(args.train_pairs), audio_root, verbose=False)
+        raw_train = ClapPairDataset(Path(args.train_pairs), audio_root, verbose=False)
+        coverage  = len(pre_train) / max(len(raw_train), 1)
+        if coverage >= 0.95:
+            use_precomputed = True
+            print(
+                f"  Pre-computed features detected ({coverage*100:.0f}% coverage) — "
+                f"using fast ClapPrecomputedDataset."
+            )
+        else:
+            print(
+                f"  Pre-computed features coverage {coverage*100:.0f}% < 95% — "
+                f"falling back to raw-audio path.  "
+                f"Run scripts/precompute_clap_features.py to enable the fast path."
+            )
+
+    if use_precomputed:
+        train_ds = ClapPrecomputedDataset(Path(args.train_pairs), audio_root)
+        val_ds   = ClapPrecomputedDataset(Path(args.val_pairs),   audio_root)
+        _collate = partial(collate_precomputed_fn, tokenizer=processor.tokenizer)
+    else:
+        train_ds = ClapPairDataset(Path(args.train_pairs), audio_root, clip_s=args.clip_s)
+        val_ds   = ClapPairDataset(Path(args.val_pairs),   audio_root, clip_s=args.clip_s)
+        _collate = partial(collate_fn, processor=processor, sr=TARGET_SR)
+
+    # Warm the OS page cache so epoch 0 is served from RAM, not disk.
+    # For the pre-computed path this warms the .clap.pt files instead of WAVs.
+    if not args.no_cache_warm:
+        warm_file_cache(train_ds, val_ds, workers=max(args.workers, 4))
+
+    loader_kwargs: dict[str, Any] = {}
+    if args.workers > 0:
+        loader_kwargs["prefetch_factor"] = max(1, args.prefetch_factor)
+        loader_kwargs["persistent_workers"] = (not args.no_persistent_workers)
 
     train_loader = DataLoader(
         train_ds,
@@ -608,6 +853,7 @@ def main(argv: list[str] | None = None) -> int:
         collate_fn  = _collate,
         pin_memory  = (device.type == "cuda"),
         drop_last   = True,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_ds,
@@ -616,6 +862,7 @@ def main(argv: list[str] | None = None) -> int:
         num_workers = args.workers,
         collate_fn  = _collate,
         pin_memory  = (device.type == "cuda"),
+        **loader_kwargs,
     )
 
     # ── optimiser + scheduler ─────────────────────────────────────────────────
