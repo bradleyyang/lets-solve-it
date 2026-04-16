@@ -15,7 +15,7 @@ pip install -r requirements-ml.txt   # torch, transformers, librosa, soundfile �
 python scripts/train_clap.py
 ```
 
-This uses all defaults: 30 workers, batch 8 × accum 8, 10 epochs, FP16 on GPU.
+This uses all defaults: auto workers (typically 3-6), batch 8 x accum 8, 10 epochs, FP16 on GPU.
 
 ---
 
@@ -118,12 +118,14 @@ python scripts/train_clap.py [OPTIONS]
 --epochs          Number of epochs              default: 10
 --batch-size      Per-GPU samples               default: 8
 --accum           Gradient accumulation steps   default: 8  → eff. batch 64
---lr              Peak learning rate            default: 5e-5
+--lr              Peak learning rate            default: 2e-5
 --warmup-steps    LR warmup steps               default: 200
---workers         DataLoader processes          default: 4
+--workers         DataLoader processes          default: auto (2-6 by CPU)
+--prefetch-factor DataLoader prefetch factor    default: 2
 --clip-s          Audio clip length (seconds)   default: 10.0
---freeze-text-epochs  Freeze text tower epochs  default: 0 (never)
+--freeze-text-epochs  Freeze text tower epochs  default: 1
 --no-amp          Disable mixed precision       flag, off by default
+--no-persistent-workers Disable persistent workers flag, off by default
 --resume          Resume from checkpoint path   optional
 --seed            Random seed                   default: 42
 ```

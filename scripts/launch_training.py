@@ -29,6 +29,13 @@ from pathlib import Path
 
 
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     repo_root = Path(__file__).resolve().parent.parent
     log_path = Path(os.environ.get("TRAINING_LOG", repo_root / "training_run_second_fine_tune.log"))
 
