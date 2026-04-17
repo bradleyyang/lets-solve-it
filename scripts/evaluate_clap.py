@@ -226,9 +226,16 @@ def build_queries(combos, tax_db, all_labels):
             strategies["sci_common"][(name, vtype)]    = f"{sci}, {name} {vt}"
             strategies["chain_common"][(name, vtype)]  = f"{chain}, {name} {vt}"
 
-        rich_variants = [v for v in all_labels.get(key, []) if len(v.split()) > 8]
+        # Skip the 5 taxonomy templates (indices 0-4); use the LLM-generated
+        # acoustic descriptions only. Rotate through all 4 variants so each
+        # combo is queried with a different description sentence.
+        all_variants = all_labels.get(key, [])
+        rich_variants = all_variants[5:]  # indices 0-4 are taxonomy templates
         if rich_variants:
-            strategies["rich"][(name, vtype)] = rich_variants[0]
+            # Use a different description per combo to avoid evaluating a single
+            # description repeatedly — hash the key for deterministic rotation.
+            idx = hash(key) % len(rich_variants)
+            strategies["rich"][(name, vtype)] = rich_variants[idx]
 
     return strategies
 
