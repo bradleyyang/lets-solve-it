@@ -469,10 +469,14 @@ def generate_plots(all_results: dict, tax_db: dict, figures_dir: Path):
     for model_key, res in all_results.items():
         fig, ax = plt.subplots(figsize=(max(6, n_strat * 1.4), 4.5))
         data  = [np.array([c["mAP"] for c in res["detail"].get(s, [])]) for s in strategies_present]
-        parts = ax.violinplot(data, positions=np.arange(n_strat), showmedians=True,
+        # filter out empty arrays that crash violinplot
+        valid_idx  = [i for i, d in enumerate(data) if len(d) > 0]
+        valid_data = [data[i] for i in valid_idx]
+        valid_pos  = np.arange(n_strat)[valid_idx]
+        parts = ax.violinplot(valid_data, positions=valid_pos, showmedians=True,
                               showextrema=True)
-        for i, pc in enumerate(parts["bodies"]):
-            pc.set_facecolor(STRATEGY_COLORS[i])
+        for j, pc in enumerate(parts["bodies"]):
+            pc.set_facecolor(STRATEGY_COLORS[valid_idx[j]])
             pc.set_alpha(0.7)
         parts["cmedians"].set_color("black")
         parts["cmedians"].set_linewidth(1.5)
@@ -538,7 +542,7 @@ def generate_plots(all_results: dict, tax_db: dict, figures_dir: Path):
 
         for i, s in enumerate(strategies_present[:6]):
             ax = axes_flat[i]
-            sims = res["sim_data"].get(s)
+            sims = res.get("sim_data", {}).get(s)
             if not sims:
                 ax.set_visible(False)
                 continue
