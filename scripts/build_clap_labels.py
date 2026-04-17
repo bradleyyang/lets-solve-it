@@ -17,23 +17,15 @@ These are per-species+type (not per-recording) — all clips of the same combo
 share the same descriptions. The multi-positive contrastive loss in train_clap.py
 handles this correctly by treating all same-combo clips as joint positives.
 
-Taxonomy lookup uses GBIF Species API (free, no auth) with local caching so
-the network is only hit once per species.
+Held-out descriptions (--holdout-rich N, default 1):
+  The last N rich descriptions per combo are withheld from training labels and
+  saved separately to data/clap_descriptions_holdout.json. The evaluation script
+  uses these as "unseen acoustic queries" — text the model never trained on —
+  to measure whether it genuinely learned acoustic language understanding.
 
 Output:
-    data/clap_all_labels.json
-    {
-        "American Robin||song": [
-            "American Robin song",
-            "Turdus migratorius song",
-            "Animalia > Chordata > Aves > Passeriformes > Turdidae > Turdus > Turdus migratorius song",
-            "Turdus migratorius, American Robin song",
-            "Animalia > Chordata > Aves > Passeriformes > Turdidae > Turdus > Turdus migratorius, American Robin song",
-            "A cheerful series of rising and falling fluty whistles...",
-            ...
-        ],
-        ...
-    }
+    data/clap_all_labels.json          — training labels (5 taxonomy + 3 rich)
+    data/clap_descriptions_holdout.json — held-out descriptions for eval only
 
 Usage:
     conda activate birdclap
@@ -48,9 +40,11 @@ from pathlib import Path
 import pandas as pd
 
 # ── paths ────────────────────────────────────────────────────────────────────
-TAXONOMY_DB    = Path("data/species_taxonomy.json")   # built by build_taxonomy_db.py
-RICH_DESC_PATH = Path("data/clap_descriptions.json")  # built by generate_clap_descriptions.py
-OUT_PATH       = Path("data/clap_all_labels.json")
+TAXONOMY_DB      = Path("data/species_taxonomy.json")
+RICH_DESC_PATH   = Path("data/clap_descriptions.json")
+OUT_PATH         = Path("data/clap_all_labels.json")
+HOLDOUT_OUT_PATH = Path("data/clap_descriptions_holdout.json")
+HOLDOUT_RICH_COUNT = 1   # hold back last N rich descriptions for eval
 
 SKIP_TYPES    = {"uncertain", "various", "various calls", "nan", ""}
 SKIP_NAMES    = {"identity unknown", "soundscape", "noise", "speech",
@@ -127,6 +121,9 @@ def main():
         help="Metadata CSVs with common_name and vocalization_type columns",
     )
     parser.add_argument("--output", default=str(OUT_PATH))
+    parser.add_argument("--holdout-rich", type=int, default=HOLDOUT_RICH_COUNT,
+                        help=f"Hold back last N rich descriptions from training labels "
+                             f"and save to clap_descriptions_holdout.json (default {HOLDOUT_RICH_COUNT})")
     args = parser.parse_args()
 
     # Load taxonomy DB (built by build_taxonomy_db.py — no network calls needed)
@@ -147,10 +144,11 @@ def main():
     combos = get_combos(args.metadata)
     print(f"\nFound {len(combos)} unique (species, type) combos\n")
 
-    results = {}
-    no_tax  = 0
-
+    results  = {}
+    holdout  = {}
+    no_tax   = 0
     skipped_non_bird = 0
+
     for i, (name, vtype) in enumerate(combos, 1):
         key = f"{name}||{vtype}"
         tax = tax_db.get(name, {})
@@ -164,11 +162,19 @@ def main():
         if not tax.get("scientific"):
             no_tax += 1
 
-        templates    = build_templates(name, tax, vtype)
-        rich         = rich_descs.get(key, [])
-        results[key] = templates + rich
+        templates = build_templates(name, tax, vtype)
+        rich      = rich_descs.get(key, [])
 
-        status = f"{len(templates)} templates + {len(rich)} rich"
+        # Split rich descriptions: train on first (N - holdout), hold back last N
+        n_holdout = args.holdout_rich if len(rich) > args.holdout_rich else 0
+        rich_train   = rich[:len(rich) - n_holdout] if n_holdout else rich
+        rich_holdout = rich[len(rich) - n_holdout:] if n_holdout else []
+
+        results[key] = templates + rich_train
+        if rich_holdout:
+            holdout[key] = rich_holdout
+
+        status = f"{len(templates)} templates + {len(rich_train)} rich (holdout: {len(rich_holdout)})"
         print(f"  [{i:4d}/{len(combos)}] {name} | {vtype}: {status}")
 
     out_path = Path(args.output)
@@ -179,9 +185,18 @@ def main():
         newline="\n",
     )
 
+    holdout_path = HOLDOUT_OUT_PATH
+    holdout_path.parent.mkdir(parents=True, exist_ok=True)
+    holdout_path.write_text(
+        json.dumps(holdout, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+        newline="\n",
+    )
+
     print(f"\n{'-'*60}")
     print(f"Done.")
     print(f"  Labels written  : {len(results)} (species, type) pairs -> {out_path}")
+    print(f"  Holdout written : {len(holdout)} combos -> {holdout_path}")
     print(f"  Skipped non-bird: {skipped_non_bird} combos (class != Aves)")
     print(f"  No taxonomy     : {no_tax} species (common name only template)")
     counts = [len(v) for v in results.values()]

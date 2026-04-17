@@ -50,6 +50,7 @@ LABELS_PATH   = Path("data/clap_all_labels.json")
 TAXONOMY_PATH = Path("data/species_taxonomy.json")
 TRAIN_OUT     = Path("data/clap_train_pairs.json")
 VAL_OUT       = Path("data/clap_val_pairs.json")
+HOLDOUT_OUT   = Path("data/clap_holdout_pairs.json")
 
 SKIP_NAMES = frozenset({
     "soundscape", "identity unknown", "noise", "speech", "canine", "squirrel",
@@ -66,7 +67,8 @@ def build_pairs(metadata_paths: list[str],
                 max_per_combo: int,
                 min_clips_per_combo: int,
                 top_n_species: int | None,
-                seed: int) -> tuple[list[dict], list[tuple[str, str]]]:
+                seed: int,
+                holdout_species: set[str] | None = None) -> tuple[list[dict], list[tuple[str, str]]]:
     """
     For each audio file, look up its (species, voc_type) key in labels and
     emit one {audio, text, combo} pair per text variant.
@@ -79,8 +81,12 @@ def build_pairs(metadata_paths: list[str],
       - max_per_combo cap: applied per combo to limit class imbalance.
 
     Returns (all_pairs, accepted_clips).
+    holdout_species: if provided, these species are routed to a separate
+    holdout dict instead of the main combo_clips.
     """
     rng = random.Random(seed)
+    if holdout_species is None:
+        holdout_species = set()
 
     # Pre-compute top-N species set if requested
     top_species: set[str] | None = None
@@ -99,6 +105,7 @@ def build_pairs(metadata_paths: list[str],
 
     # First pass: collect all valid clips per combo (respecting cap)
     combo_clips: dict[str, list[str]] = {}
+    holdout_clips: dict[str, list[str]] = {}   # clips from held-out species
 
     for path in metadata_paths:
         p = Path(path)
@@ -144,6 +151,11 @@ def build_pairs(metadata_paths: list[str],
                     continue
                 key = key_full
 
+            # Route holdout species to separate dict (no cap needed for eval)
+            if name in holdout_species:
+                holdout_clips.setdefault(key, []).append(fpath)
+                continue
+
             clips = combo_clips.setdefault(key, [])
             if len(clips) < max_per_combo:
                 clips.append(fpath)
@@ -170,7 +182,7 @@ def build_pairs(metadata_paths: list[str],
         for text in labels[key]:
             all_pairs.append({"audio": fpath, "text": text, "combo": key})
 
-    return all_pairs, accepted
+    return all_pairs, accepted, holdout_clips
 
 
 def main():
@@ -186,6 +198,10 @@ def main():
                         help=f"Drop combos with fewer than this many clips (default {MIN_CLIPS_PER_COMBO})")
     parser.add_argument("--top-n-species", type=int, default=None,
                         help="Only include the N species with the most clips (default: all)")
+    parser.add_argument("--holdout-species-frac", type=float, default=0.2,
+                        help="Fraction of species held out entirely from train/val for zero-shot eval "
+                             "(default 0.2). Their clips are written to clap_holdout_pairs.json.")
+    parser.add_argument("--holdout-out", default=str(HOLDOUT_OUT))
     parser.add_argument("--val-split", type=float, default=0.1,
                         help="Fraction of clips held out for validation (default 0.1)")
     parser.add_argument("--seed", type=int, default=42)
@@ -202,9 +218,25 @@ def main():
     else:
         print(f"[warn] Taxonomy file not found at {tax_path} — bird filter disabled")
 
-    all_pairs, accepted_clips = build_pairs(
+    # Deterministic holdout species selection (sorted alphabetically → every Nth)
+    holdout_species: set[str] = set()
+    if args.holdout_species_frac > 0:
+        all_species = sorted({
+            str(row[next((c for c in ("common_name","species","name") if c in pd.read_csv(p).columns), None)]).strip()
+            for p in args.metadata if Path(p).exists()
+            for _, row in pd.read_csv(p).iterrows()
+            if tax_db.get(str(row.get("common_name","")).strip(), {}).get("class") == "Aves"
+        })
+        step = max(1, round(1.0 / args.holdout_species_frac))
+        holdout_species = set(all_species[::step])
+        print(f"Holdout species : {len(holdout_species)} / {len(all_species)} "
+              f"({100*len(holdout_species)/max(len(all_species),1):.1f}%) "
+              f"— excluded from train/val, written to {args.holdout_out}")
+
+    all_pairs, accepted_clips, holdout_clips = build_pairs(
         args.metadata, labels, tax_db,
-        args.max_per_combo, args.min_clips_per_combo, args.top_n_species, args.seed,
+        args.max_per_combo, args.min_clips_per_combo, args.top_n_species,
+        args.seed, holdout_species=holdout_species,
     )
 
     n_clips   = len(accepted_clips)
@@ -251,6 +283,21 @@ def main():
         for p in clip_pairs:
             print(f"      text: {p['text'][:80]}")
         print()
+
+    # Write holdout pairs (clips from species never seen in training)
+    if holdout_clips:
+        holdout_pairs: list[dict] = []
+        for key, clips in holdout_clips.items():
+            for fpath in clips:
+                for text in labels.get(key, []):
+                    holdout_pairs.append({"audio": fpath, "text": text, "combo": key})
+        holdout_path = Path(args.holdout_out)
+        holdout_path.parent.mkdir(parents=True, exist_ok=True)
+        holdout_path.write_text(json.dumps(holdout_pairs, indent=2, ensure_ascii=False))
+        n_holdout_clips = len({p["audio"] for p in holdout_pairs})
+        n_holdout_combos = len(holdout_clips)
+        print(f"  Holdout: {len(holdout_pairs)} pairs ({n_holdout_clips} clips, "
+              f"{n_holdout_combos} combos) → {holdout_path}")
 
     print(f"Next step:")
     print(f"  Fine-tune CLAP with {train_path} and {val_path}")

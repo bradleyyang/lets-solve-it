@@ -48,25 +48,29 @@ import torch.nn.functional as F
 from transformers import ClapModel, ClapProcessor
 
 # ── defaults ──────────────────────────────────────────────────────────────────
-DEFAULT_MODEL      = "laion/clap-htsat-fused"
-DEFAULT_VAL_PAIRS  = Path("data/clap_val_pairs.json")
-DEFAULT_METADATA   = Path("data/xc_metadata_unified.csv")
-DEFAULT_LABELS     = Path("data/clap_all_labels.json")
-DEFAULT_TAXONOMY   = Path("data/species_taxonomy.json")
-DEFAULT_AUDIO_ROOT = Path(".")
-DEFAULT_OUTPUT     = Path("results/eval_results.json")
-DEFAULT_FIGURES    = Path("results/figures")
-AUDIO_SR           = 48_000
-CLIP_SECONDS       = 10
-MIN_DURATION_S     = 0.5  # match scripts/train_clap.py
-STRATEGY_ORDER     = ["name", "scientific", "chain", "sci_common", "chain_common", "rich"]
-STRATEGY_LABELS    = {
+DEFAULT_MODEL         = "laion/clap-htsat-fused"
+DEFAULT_VAL_PAIRS     = Path("data/clap_val_pairs.json")
+DEFAULT_HOLDOUT_PAIRS = Path("data/clap_holdout_pairs.json")
+DEFAULT_HOLDOUT_DESCS = Path("data/clap_descriptions_holdout.json")
+DEFAULT_METADATA      = Path("data/xc_metadata_unified.csv")
+DEFAULT_LABELS        = Path("data/clap_all_labels.json")
+DEFAULT_TAXONOMY      = Path("data/species_taxonomy.json")
+DEFAULT_AUDIO_ROOT    = Path(".")
+DEFAULT_OUTPUT        = Path("results/eval_results.json")
+DEFAULT_FIGURES       = Path("results/figures")
+AUDIO_SR              = 48_000
+CLIP_SECONDS          = 10
+MIN_DURATION_S        = 0.5  # match scripts/train_clap.py
+STRATEGY_ORDER        = ["name", "scientific", "chain", "sci_common", "chain_common",
+                         "rich", "rich_holdout"]
+STRATEGY_LABELS       = {
     "name":         "Common name",
     "scientific":   "Scientific name",
     "chain":        "Taxonomy chain",
     "sci_common":   "Sci + common",
     "chain_common": "Chain + common",
     "rich":         "Rich description",
+    "rich_holdout": "Rich (held-out)",
 }
 
 
@@ -204,7 +208,7 @@ def retrieval_metrics(sim_row: np.ndarray,
 # Query builders
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_queries(combos, tax_db, all_labels):
+def build_queries(combos, tax_db, all_labels, holdout_descs=None):
     strategies = {s: {} for s in STRATEGY_ORDER}
     for name, vtype in combos:
         key = f"{name}||{vtype}"
@@ -226,16 +230,22 @@ def build_queries(combos, tax_db, all_labels):
             strategies["sci_common"][(name, vtype)]    = f"{sci}, {name} {vt}"
             strategies["chain_common"][(name, vtype)]  = f"{chain}, {name} {vt}"
 
-        # Skip the 5 taxonomy templates (indices 0-4); use the LLM-generated
-        # acoustic descriptions only. Rotate through all 4 variants so each
-        # combo is queried with a different description sentence.
+        # rich: LLM acoustic descriptions used in training (indices 5+)
+        # Rotate across variants so every combo uses a different description.
         all_variants = all_labels.get(key, [])
         rich_variants = all_variants[5:]  # indices 0-4 are taxonomy templates
         if rich_variants:
-            # Use a different description per combo to avoid evaluating a single
-            # description repeatedly — hash the key for deterministic rotation.
             idx = hash(key) % len(rich_variants)
             strategies["rich"][(name, vtype)] = rich_variants[idx]
+
+        # rich_holdout: descriptions held back from training labels
+        # These are acoustic queries the model has NEVER seen — a fair test of
+        # whether it learned acoustic language vs memorising training text.
+        if holdout_descs:
+            held = holdout_descs.get(key, [])
+            if held:
+                idx = hash(key) % len(held)
+                strategies["rich_holdout"][(name, vtype)] = held[idx]
 
     return strategies
 
@@ -650,19 +660,23 @@ def print_table(label, agg):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint",  default=None)
-    parser.add_argument("--also-base",   action="store_true")
-    parser.add_argument("--model",       default=DEFAULT_MODEL)
-    parser.add_argument("--val-pairs",   default=str(DEFAULT_VAL_PAIRS))
-    parser.add_argument("--metadata",    default=str(DEFAULT_METADATA))
-    parser.add_argument("--labels",      default=str(DEFAULT_LABELS))
-    parser.add_argument("--taxonomy",    default=str(DEFAULT_TAXONOMY))
-    parser.add_argument("--audio-root",  default=str(DEFAULT_AUDIO_ROOT))
-    parser.add_argument("--output",      default=str(DEFAULT_OUTPUT))
-    parser.add_argument("--figures-dir", default=str(DEFAULT_FIGURES))
-    parser.add_argument("--batch-size",  type=int, default=16)
-    parser.add_argument("--device",      default=None)
-    parser.add_argument("--no-plots",    action="store_true", help="Skip plot generation")
+    parser.add_argument("--checkpoint",     default=None)
+    parser.add_argument("--also-base",      action="store_true")
+    parser.add_argument("--model",          default=DEFAULT_MODEL)
+    parser.add_argument("--val-pairs",      default=str(DEFAULT_VAL_PAIRS))
+    parser.add_argument("--holdout-pairs",  default=str(DEFAULT_HOLDOUT_PAIRS),
+                        help="Path to clap_holdout_pairs.json for zero-shot species eval")
+    parser.add_argument("--holdout-descs",  default=str(DEFAULT_HOLDOUT_DESCS),
+                        help="Path to clap_descriptions_holdout.json for held-out acoustic query eval")
+    parser.add_argument("--metadata",       default=str(DEFAULT_METADATA))
+    parser.add_argument("--labels",         default=str(DEFAULT_LABELS))
+    parser.add_argument("--taxonomy",       default=str(DEFAULT_TAXONOMY))
+    parser.add_argument("--audio-root",     default=str(DEFAULT_AUDIO_ROOT))
+    parser.add_argument("--output",         default=str(DEFAULT_OUTPUT))
+    parser.add_argument("--figures-dir",    default=str(DEFAULT_FIGURES))
+    parser.add_argument("--batch-size",     type=int, default=16)
+    parser.add_argument("--device",         default=None)
+    parser.add_argument("--no-plots",       action="store_true", help="Skip plot generation")
     args = parser.parse_args()
 
     device = args.device or (
@@ -675,6 +689,15 @@ def main():
     val_pairs  = json.loads(Path(args.val_pairs).read_text(encoding="utf-8"))
     all_labels = json.loads(Path(args.labels).read_text(encoding="utf-8"))
     tax_db     = json.loads(Path(args.taxonomy).read_text(encoding="utf-8"))
+
+    # Load held-out descriptions if available
+    holdout_descs: dict = {}
+    holdout_desc_path = Path(args.holdout_descs)
+    if holdout_desc_path.exists():
+        holdout_descs = json.loads(holdout_desc_path.read_text(encoding="utf-8"))
+        print(f"Loaded {len(holdout_descs)} held-out description keys from {holdout_desc_path}")
+    else:
+        print(f"[info] No held-out descriptions at {holdout_desc_path} — rich_holdout strategy skipped")
 
     df       = pd.read_csv(args.metadata, encoding="utf-8")
     name_col = next((c for c in ("common_name", "species", "name") if c in df.columns), None)
@@ -696,7 +719,7 @@ def main():
     val_combos = list({clip_to_combo[c] for c in val_clips if c in clip_to_combo})
     print(f"Val clips: {len(val_clips)}  |  (species, type) combos: {len(val_combos)}")
 
-    strategies = build_queries(val_combos, tax_db, all_labels)
+    strategies = build_queries(val_combos, tax_db, all_labels, holdout_descs)
     for s, q in strategies.items():
         print(f"  {s:<16}: {len(q)} queries")
 
@@ -719,6 +742,44 @@ def main():
     if args.also_base or not args.checkpoint:
         print(f"\n{'='*72}\n  Evaluating: base model  ({args.model})")
         all_results["base"] = evaluate(None, f"Base model (zero-shot): {args.model}")
+
+    # ── Zero-shot holdout species eval ────────────────────────────────────────
+    # Evaluates on species that were NEVER in training — tests whether the model
+    # learned acoustic features that generalise, vs memorising a species lookup.
+    holdout_pairs_path = Path(args.holdout_pairs)
+    if holdout_pairs_path.exists():
+        print(f"\n{'='*72}")
+        print(f"  Zero-shot eval: unseen species ({holdout_pairs_path})")
+        holdout_pairs_data = json.loads(holdout_pairs_path.read_text(encoding="utf-8"))
+        seen_h, holdout_clips_list = set(), []
+        for p in holdout_pairs_data:
+            if p["audio"] not in seen_h:
+                seen_h.add(p["audio"]); holdout_clips_list.append(p["audio"])
+        holdout_combos = list({
+            clip_to_combo[c] for c in holdout_clips_list if c in clip_to_combo
+        })
+        print(f"  Holdout clips: {len(holdout_clips_list)}  |  combos: {len(holdout_combos)}")
+
+        # Only taxonomy queries for holdout (no rich descriptions for unseen species)
+        holdout_strats = build_queries(holdout_combos, tax_db, all_labels)
+
+        def evaluate_holdout(checkpoint, label):
+            model, processor = load_model(checkpoint, args.model, device)
+            agg, detail, _ = run_eval(
+                model, processor, holdout_clips_list, clip_to_combo,
+                holdout_strats, audio_root, device, args.batch_size)
+            del model
+            print_table(f"{label} [ZERO-SHOT unseen species]", agg)
+            return {"agg": agg, "detail": detail}
+
+        if args.checkpoint:
+            all_results["finetuned_zeroshot"] = evaluate_holdout(
+                args.checkpoint, f"Fine-tuned: {args.checkpoint}")
+        if args.also_base or not args.checkpoint:
+            all_results["base_zeroshot"] = evaluate_holdout(
+                None, f"Base model (zero-shot): {args.model}")
+    else:
+        print(f"\n[info] No holdout pairs at {holdout_pairs_path} — zero-shot species eval skipped")
 
     # Delta table
     if "finetuned" in all_results and "base" in all_results:
