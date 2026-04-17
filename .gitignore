@@ -5,6 +5,18 @@
 scripts/data/
 checkpoints/
 
+# Generated training-pair JSONs (rebuilt by build_clap_training_pairs.py)
+data/clap_train_pairs.json
+data/clap_val_pairs.json
+
+# Training / eval logs and precompute logs
+*.log
+precompute_*.log
+eval_*.log
+
+# Evaluation outputs (JSON + PDFs) — too large / generated artifacts
+results/
+
 # UTF-16 backups of logs (one-time conversion artifacts)
 training_run.log.utf16le.bak
 convert_wav.log.utf16le.bak
