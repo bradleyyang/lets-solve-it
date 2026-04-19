@@ -20,13 +20,19 @@ Six query strategies:
   6. rich          LLM-generated acoustic description (first variant)
 
 Plots saved to results/figures/:
-  1. strategy_comparison.pdf   — mAP / MRR / R@K bar chart per strategy
-  2. recall_at_k.pdf           — R@K curve (K=1..20) per strategy
-  3. map_distribution.pdf      — violin plot of per-combo mAP per strategy
-  4. class_breakdown.pdf       — mAP by taxonomic class × strategy
-  5. similarity_distribution.pdf — KDE of positive vs negative cosine sim
-  6. hardest_easiest.pdf       — top-20 hardest / easiest species by mAP
-  7. delta_finetuned_vs_base.pdf — Δmetric bar chart  (only with --also-base)
+  1. strategy_comparison.pdf      — mAP / MRR / R@K bar chart per strategy
+  2. recall_at_k.pdf              — R@K curve (K=1..20) per strategy
+  3. map_distribution.pdf         — violin plot of per-combo mAP per strategy
+  4. class_breakdown.pdf          — mAP by taxonomic class × strategy
+  5. similarity_distribution.pdf  — KDE of positive vs negative cosine sim
+  6. hardest_easiest.pdf          — top-20 hardest / easiest species by mAP
+  7. rank_distribution.pdf        — histogram of first-hit rank per strategy
+  8. rank_cdf.pdf                 — CDF of first-hit rank (full gallery range)
+  9. delta_finetuned_vs_base.pdf  — Δmetric bar chart  (only with --also-base)
+
+Query strategies now return lists of texts; run_eval averages embeddings before
+computing similarity. The "all_variants" strategy uses all 8 label variants per
+combo (5 taxonomy + 3 rich) as an ensemble — free improvement at inference time.
 
 Usage:
     conda activate birdclap
@@ -62,7 +68,7 @@ AUDIO_SR              = 48_000
 CLIP_SECONDS          = 10
 MIN_DURATION_S        = 0.5  # match scripts/train_clap.py
 STRATEGY_ORDER        = ["name", "scientific", "chain", "sci_common", "chain_common",
-                         "rich", "rich_holdout"]
+                         "rich", "rich_holdout", "all_variants"]
 STRATEGY_LABELS       = {
     "name":         "Common name",
     "scientific":   "Scientific name",
@@ -71,6 +77,7 @@ STRATEGY_LABELS       = {
     "chain_common": "Chain + common",
     "rich":         "Rich description",
     "rich_holdout": "Rich (held-out)",
+    "all_variants": "Ensemble (all)",
 }
 
 
@@ -189,6 +196,17 @@ def retrieval_metrics(sim_row: np.ndarray,
             ap_sum += hits / rank
     ap = ap_sum / n_pos if n_pos else 0.0
 
+    # Rank of first positive hit (1-indexed); 0 if no positives
+    first_hit_rank = 0
+    for rank, idx in enumerate(ranked, 1):
+        if idx in pos_set:
+            first_hit_rank = rank
+            break
+
+    # Median rank of ALL positives in the gallery
+    pos_ranks = [rank for rank, idx in enumerate(ranked, 1) if idx in pos_set]
+    median_pos_rank = float(np.median(pos_ranks)) if pos_ranks else float(n_total)
+
     # Positive / negative similarity distributions
     pos_sims = sim_row[positive_indices].tolist()
     neg_mask = np.ones(n_total, dtype=bool)
@@ -199,6 +217,8 @@ def retrieval_metrics(sim_row: np.ndarray,
         "mAP": ap,
         "MRR": mrr,
         "recall_at_k": recall_at_k,
+        "first_hit_rank": first_hit_rank,
+        "median_pos_rank": median_pos_rank,
         "pos_sims": pos_sims,
         "neg_sims": neg_sims,
     }
@@ -209,6 +229,12 @@ def retrieval_metrics(sim_row: np.ndarray,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_queries(combos, tax_db, all_labels, holdout_descs=None):
+    """
+    Returns strategies dict where each value is a list of query texts.
+    Single-text strategies use a one-element list; the ensemble strategy
+    uses all available variants. run_eval encodes all texts and averages
+    their embeddings before computing the similarity matrix.
+    """
     strategies = {s: {} for s in STRATEGY_ORDER}
     for name, vtype in combos:
         key = f"{name}||{vtype}"
@@ -223,29 +249,36 @@ def build_queries(combos, tax_db, all_labels, holdout_descs=None):
         chain   = " > ".join(p for p in [kingdom, phylum, cls, order, family, genus, sci] if p)
         vt = vtype.strip()
 
-        strategies["name"][(name, vtype)] = f"{name} {vt}"
+        # Individual strategies — single text wrapped in list
+        strategies["name"][(name, vtype)] = [f"{name} {vt}"]
         if sci:
-            strategies["scientific"][(name, vtype)]   = f"{sci} {vt}"
-            strategies["chain"][(name, vtype)]         = f"{chain} {vt}"
-            strategies["sci_common"][(name, vtype)]    = f"{sci}, {name} {vt}"
-            strategies["chain_common"][(name, vtype)]  = f"{chain}, {name} {vt}"
+            strategies["scientific"][(name, vtype)]   = [f"{sci} {vt}"]
+            strategies["chain"][(name, vtype)]         = [f"{chain} {vt}"]
+            strategies["sci_common"][(name, vtype)]    = [f"{sci}, {name} {vt}"]
+            strategies["chain_common"][(name, vtype)]  = [f"{chain}, {name} {vt}"]
 
-        # rich: LLM acoustic descriptions used in training (indices 5+)
-        # Rotate across variants so every combo uses a different description.
-        all_variants = all_labels.get(key, [])
-        rich_variants = all_variants[5:]  # indices 0-4 are taxonomy templates
+        all_label_variants = all_labels.get(key, [])
+        tax_templates = all_label_variants[:5]   # indices 0-4: taxonomy
+        rich_variants = all_label_variants[5:]   # indices 5+: LLM descriptions
+
+        # rich: single rotating acoustic description (trained on)
         if rich_variants:
             idx = hash(key) % len(rich_variants)
-            strategies["rich"][(name, vtype)] = rich_variants[idx]
+            strategies["rich"][(name, vtype)] = [rich_variants[idx]]
 
-        # rich_holdout: descriptions held back from training labels
-        # These are acoustic queries the model has NEVER seen — a fair test of
-        # whether it learned acoustic language vs memorising training text.
+        # rich_holdout: description held back from training — unseen acoustic query
         if holdout_descs:
             held = holdout_descs.get(key, [])
             if held:
                 idx = hash(key) % len(held)
-                strategies["rich_holdout"][(name, vtype)] = held[idx]
+                strategies["rich_holdout"][(name, vtype)] = [held[idx]]
+
+        # all_variants: ensemble of ALL available texts for this combo.
+        # At query time, all texts are encoded and their embeddings are averaged
+        # before computing similarity — free improvement, no retraining needed.
+        ensemble_texts = (tax_templates if sci else [f"{name} {vt}"]) + rich_variants
+        if ensemble_texts:
+            strategies["all_variants"][(name, vtype)] = ensemble_texts
 
     return strategies
 
@@ -331,24 +364,42 @@ def run_eval(model, processor, val_clips, clip_to_combo,
             print(f"  [{strategy}] no valid combos - skipping")
             continue
 
-        print(f"  [{strategy}] encoding {len(eval_combos)} queries ...")
-        query_texts = [q for _, q in eval_combos]
-        text_embs = []
-        for i in range(0, len(query_texts), 64):
-            text_embs.append(encode_text_batch(query_texts[i:i+64], processor, model, device))
-        text_matrix = torch.cat(text_embs, dim=0).numpy()
+        n_variants_avg = sum(len(q) for _, q in eval_combos) / len(eval_combos)
+        print(f"  [{strategy}] encoding {len(eval_combos)} queries "
+              f"(avg {n_variants_avg:.1f} texts/combo) ...")
+
+        # Flatten all per-combo texts into one list, encode in batches of 64,
+        # then fold back and average per-combo embeddings (re-normalised).
+        flat_texts = [t for _, q in eval_combos for t in q]
+        n_per_combo = [len(q) for _, q in eval_combos]
+        flat_embs = []
+        for i in range(0, len(flat_texts), 64):
+            flat_embs.append(encode_text_batch(flat_texts[i:i+64], processor, model, device))
+        flat_embs = torch.cat(flat_embs, dim=0)   # (total_texts, D)
+
+        # Average and re-normalise per combo
+        combo_embs = []
+        offset = 0
+        for n in n_per_combo:
+            mean_emb = flat_embs[offset : offset + n].mean(dim=0)
+            combo_embs.append(F.normalize(mean_emb, dim=0))
+            offset += n
+        text_matrix = torch.stack(combo_embs).numpy()   # (n_combos, D)
         sim_matrix  = text_matrix @ audio_matrix.T
 
         per_combo, all_pos_sims, all_neg_sims = [], [], []
+        n_gallery = len(valid_clips)
         for q_idx, (combo, _) in enumerate(eval_combos):
             m = retrieval_metrics(sim_matrix[q_idx], combo_to_indices[combo])
             per_combo.append({
-                "species":      combo[0],
-                "voc_type":     combo[1],
-                "mAP":          m["mAP"],
-                "MRR":          m["MRR"],
-                "recall_at_k":  m["recall_at_k"],
-                "n_positives":  len(combo_to_indices[combo]),
+                "species":         combo[0],
+                "voc_type":        combo[1],
+                "mAP":             m["mAP"],
+                "MRR":             m["MRR"],
+                "recall_at_k":     m["recall_at_k"],
+                "n_positives":     len(combo_to_indices[combo]),
+                "first_hit_rank":  m["first_hit_rank"],
+                "median_pos_rank": m["median_pos_rank"],
             })
             all_pos_sims.extend(m["pos_sims"])
             all_neg_sims.extend(m["neg_sims"])
@@ -359,13 +410,21 @@ def run_eval(model, processor, val_clips, clip_to_combo,
             a[metric] = float(np.mean([c[metric] for c in per_combo]))
         for k in range(1, 21):
             a[f"R@{k}"] = float(np.mean([c["recall_at_k"][k] for c in per_combo]))
-        a["n_queries"] = len(eval_combos)
+        a["n_queries"]        = len(eval_combos)
+        a["median_first_rank"]= float(np.median([c["first_hit_rank"] for c in per_combo]))
+        a["mean_first_rank"]  = float(np.mean([c["first_hit_rank"] for c in per_combo]))
+        a["median_pos_rank"]  = float(np.median([c["median_pos_rank"] for c in per_combo]))
+        # Percentile of first hit: how far into the gallery must you scroll on average?
+        a["first_rank_pct"]   = float(np.mean(
+            [c["first_hit_rank"] / n_gallery for c in per_combo]
+        ))
         agg[strategy]      = a
         detail[strategy]   = per_combo
         sim_data[strategy] = {"pos": all_pos_sims, "neg": all_neg_sims}
 
         print(f"    mAP={a['mAP']:.3f}  MRR={a['MRR']:.3f}  "
               f"R@1={a['R@1']:.3f}  R@5={a['R@5']:.3f}  R@10={a['R@10']:.3f}  "
+              f"median_rank={a['median_first_rank']:.0f}/{n_gallery}  "
               f"({a['n_queries']} queries)")
 
     return agg, detail, sim_data
@@ -606,7 +665,80 @@ def generate_plots(all_results: dict, tax_db: dict, figures_dir: Path):
         plt.close(fig)
         print(f"  Saved: hardest_easiest_{model_key}.pdf")
 
-    # ── 7. Delta chart (fine-tuned − base) ────────────────────────────────────
+    # ── 7. Rank distribution ─────────────────────────────────────────────────
+    # Shows where in the gallery the first positive hit lands for each query.
+    # A model that genuinely understands acoustics should cluster ranks near 1.
+    for model_key, res in all_results.items():
+        fig, axes = plt.subplots(1, len(strategies_present),
+                                 figsize=(3.2 * len(strategies_present), 3.8),
+                                 sharey=True)
+        if len(strategies_present) == 1:
+            axes = [axes]
+        fig.suptitle(f"First-Hit Rank Distribution — {model_key}", fontweight="bold")
+
+        n_gallery_est = None
+        for ax, s in zip(axes, strategies_present):
+            ranks = [c["first_hit_rank"] for c in res["detail"].get(s, []) if c["first_hit_rank"] > 0]
+            if not ranks:
+                ax.set_visible(False)
+                continue
+            if n_gallery_est is None:
+                n_gallery_est = max(ranks) + 1  # rough upper bound
+            med = np.median(ranks)
+            mn  = np.mean(ranks)
+            # Use log-spaced bins so near-rank-1 entries are visible
+            bins = np.unique(np.round(
+                np.geomspace(1, max(ranks) + 1, 30)
+            ).astype(int))
+            ax.hist(ranks, bins=bins, color=STRATEGY_COLORS[strategies_present.index(s)],
+                    alpha=0.8, edgecolor="white", linewidth=0.4)
+            ax.axvline(med, color="black", linewidth=1.2, linestyle="--")
+            ax.text(0.97, 0.96, f"med={med:.0f}\nmean={mn:.0f}",
+                    transform=ax.transAxes, ha="right", va="top", fontsize=7.5,
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.8))
+            ax.set_xscale("log")
+            ax.set_title(STRATEGY_LABELS.get(s, s), fontsize=8)
+            ax.set_xlabel("Rank of first hit (log scale)", fontsize=7)
+            ax.set_ylabel("# queries", fontsize=7)
+
+        fig.tight_layout()
+        fig.savefig(figures_dir / f"rank_distribution_{model_key}.pdf")
+        plt.close(fig)
+        print(f"  Saved: rank_distribution_{model_key}.pdf")
+
+    # ── 8. Rank CDF ──────────────────────────────────────────────────────────
+    # Cumulative fraction of queries where first hit ≤ k — complements R@K curve
+    # but on the full rank range so you can see the long tail.
+    for model_key, res in all_results.items():
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.set_title(f"Rank CDF (fraction of queries with first hit ≤ rank) — {model_key}",
+                     fontweight="bold")
+        max_rank_cdf = 0
+        for i, s in enumerate(strategies_present):
+            ranks = sorted(c["first_hit_rank"] for c in res["detail"].get(s, [])
+                           if c["first_hit_rank"] > 0)
+            if not ranks:
+                continue
+            max_rank_cdf = max(max_rank_cdf, ranks[-1])
+            n = len(ranks)
+            ax.step([0] + ranks, np.linspace(0, 1, n + 1),
+                    color=STRATEGY_COLORS[i], linewidth=1.5,
+                    label=STRATEGY_LABELS.get(s, s))
+        ax.axvline(1,  color="gray", linewidth=0.7, linestyle=":")
+        ax.axvline(5,  color="gray", linewidth=0.7, linestyle=":")
+        ax.axvline(10, color="gray", linewidth=0.7, linestyle=":")
+        ax.set_xscale("log")
+        ax.set_xlim(1, max(max_rank_cdf, 10))
+        ax.set_ylim(0, 1.05)
+        ax.set_xlabel("Rank (log scale)")
+        ax.set_ylabel("Cumulative fraction of queries")
+        ax.legend(fontsize=8, frameon=False)
+        fig.tight_layout()
+        fig.savefig(figures_dir / f"rank_cdf_{model_key}.pdf")
+        plt.close(fig)
+        print(f"  Saved: rank_cdf_{model_key}.pdf")
+
+    # ── 9. Delta chart (fine-tuned − base) ────────────────────────────────────
     if "finetuned" in all_results and "base" in all_results:
         metrics = ["mAP", "MRR", "R@1", "R@5", "R@10"]
         n_m     = len(metrics)
@@ -646,16 +778,20 @@ def generate_plots(all_results: dict, tax_db: dict, figures_dir: Path):
 
 def print_table(label, agg):
     strats = [s for s in STRATEGY_ORDER if s in agg]
-    print(f"\n{'-'*72}")
+    print(f"\n{'-'*90}")
     print(f"  {label}")
-    print(f"{'-'*72}")
-    print(f"  {'Strategy':<16} {'mAP':>7} {'MRR':>7} {'R@1':>7} {'R@5':>7} {'R@10':>7}  Queries")
-    print(f"  {'-'*68}")
+    print(f"{'-'*90}")
+    print(f"  {'Strategy':<16} {'mAP':>7} {'MRR':>7} {'R@1':>7} {'R@5':>7} {'R@10':>7}"
+          f"  {'MedRank':>8} {'MeanRank':>9}  Queries")
+    print(f"  {'-'*86}")
     for s in strats:
         r = agg[s]
+        med_rank  = r.get("median_first_rank", float("nan"))
+        mean_rank = r.get("mean_first_rank",   float("nan"))
         print(f"  {s:<16} {r['mAP']:>7.3f} {r['MRR']:>7.3f} "
-              f"{r['R@1']:>7.3f} {r['R@5']:>7.3f} {r['R@10']:>7.3f}  {r['n_queries']}")
-    print(f"{'-'*72}")
+              f"{r['R@1']:>7.3f} {r['R@5']:>7.3f} {r['R@10']:>7.3f}"
+              f"  {med_rank:>8.0f} {mean_rank:>9.1f}  {r['n_queries']}")
+    print(f"{'-'*90}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

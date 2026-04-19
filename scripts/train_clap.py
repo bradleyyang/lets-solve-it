@@ -52,6 +52,7 @@ import argparse
 import json
 import math
 import os
+import random
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -63,7 +64,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
 from transformers import ClapModel, ClapProcessor
 
@@ -96,7 +97,8 @@ def default_workers() -> int:
     return max(2, min(6, cpu_count // 2))
 
 
-def load_audio(path: Path, sr: int = TARGET_SR, clip_s: float = CLIP_DURATION_S) -> np.ndarray | None:
+def load_audio(path: Path, sr: int = TARGET_SR, clip_s: float = CLIP_DURATION_S,
+               augment: bool = False) -> np.ndarray | None:
     """
     Load MP3/WAV at `sr` Hz, mono.  Centre-crops or pads to `clip_s` seconds.
     Returns None when the file cannot be decoded or is too short.
@@ -122,7 +124,8 @@ def load_audio(path: Path, sr: int = TARGET_SR, clip_s: float = CLIP_DURATION_S)
             if len(y) < min_len:
                 return None
             if len(y) >= target_len:
-                start = (len(y) - target_len) // 2
+                max_start = len(y) - target_len
+                start = random.randint(0, max_start) if augment else max_start // 2
                 y = y[start : start + target_len]
             else:
                 y = np.pad(y, (0, target_len - len(y)))
@@ -140,8 +143,9 @@ def load_audio(path: Path, sr: int = TARGET_SR, clip_s: float = CLIP_DURATION_S)
         return None
 
     if len(y) >= target_len:
-        # Centre-crop
-        start = (len(y) - target_len) // 2
+        # Random crop during training, centre-crop otherwise
+        max_start = len(y) - target_len
+        start = random.randint(0, max_start) if augment else max_start // 2
         y = y[start : start + target_len]
     else:
         # Zero-pad on the right
@@ -168,14 +172,22 @@ class ClapPairDataset(Dataset):
         sr: int = TARGET_SR,
         clip_s: float = CLIP_DURATION_S,
         verbose: bool = True,
+        augment: bool = False,
+        labels_path: Path | None = None,
     ) -> None:
         raw: list[dict[str, str]] = json.loads(
             pairs_path.read_text(encoding="utf-8")
         )
 
-        self.sr     = sr
-        self.clip_s = clip_s
-        self.root   = audio_root
+        self.sr      = sr
+        self.clip_s  = clip_s
+        self.root    = audio_root
+        self.augment = augment
+        # Full label pool per combo for text augmentation (random pick each step)
+        self.labels: dict[str, list[str]] = (
+            json.loads(labels_path.read_text(encoding="utf-8"))
+            if labels_path and labels_path.exists() else {}
+        )
 
         # Pre-filter to rows whose audio file actually exists on disk.
         # The waveform is loaded lazily in __getitem__ to keep RAM low.
@@ -199,15 +211,55 @@ class ClapPairDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any] | None:
         pair  = self.pairs[idx]
-        audio = load_audio(self.root / pair["audio"], self.sr, self.clip_s)
+        audio = load_audio(self.root / pair["audio"], self.sr, self.clip_s, self.augment)
         if audio is None:
             return None
+        if self.augment:
+            # Random gain: scale volume ±40% so model is invariant to recording level
+            audio = audio * random.uniform(0.6, 1.4)
+            # Gaussian noise: simulate low-SNR field recordings
+            audio = audio + np.random.randn(len(audio)).astype(np.float32) * 0.002
+
+        # Text augmentation: randomly pick any label variant for this combo.
+        # Exposes the model to all 8 templates during training rather than one fixed text.
+        combo = pair.get("combo", "")
+        text  = pair["text"]
+        if self.augment and combo and combo in self.labels:
+            text = random.choice(self.labels[combo])
+
         return {
             "audio":      audio,
-            "text":       pair["text"],
-            "combo":      pair.get("combo", ""),   # species||type — may be absent in old pair files
+            "text":       text,
+            "combo":      combo,
             "audio_path": pair["audio"],
         }
+
+
+def spec_augment(
+    features: "Tensor",
+    time_mask_max: int = 100,
+    freq_mask_max: int = 16,
+    n_time_masks: int = 2,
+    n_freq_masks: int = 2,
+) -> "Tensor":
+    """
+    SpecAugment: randomly zero out time and frequency bands on a mel spectrogram.
+    Operates on the last two dims (..., freq, time) so it works regardless of
+    whether the leading batch/channel dims are present.
+    Compatible with ClapPrecomputedDataset (applied after loading .clap.pt).
+    """
+    x = features.clone()
+    freq_dim = x.shape[-2]
+    time_dim = x.shape[-1]
+    for _ in range(n_time_masks):
+        t = random.randint(1, max(1, min(time_mask_max, time_dim - 1)))
+        t0 = random.randint(0, time_dim - t)
+        x[..., :, t0 : t0 + t] = 0.0
+    for _ in range(n_freq_masks):
+        f = random.randint(1, max(1, min(freq_mask_max, freq_dim - 1)))
+        f0 = random.randint(0, freq_dim - f)
+        x[..., f0 : f0 + f, :] = 0.0
+    return x
 
 
 class ClapPrecomputedDataset(Dataset):
@@ -228,11 +280,18 @@ class ClapPrecomputedDataset(Dataset):
         pairs_path: Path,
         audio_root: Path,
         verbose: bool = True,
+        augment: bool = False,
+        labels_path: Path | None = None,
     ) -> None:
         raw: list[dict[str, str]] = json.loads(
             pairs_path.read_text(encoding="utf-8")
         )
-        self.root = audio_root
+        self.root    = audio_root
+        self.augment = augment
+        self.labels: dict[str, list[str]] = (
+            json.loads(labels_path.read_text(encoding="utf-8"))
+            if labels_path and labels_path.exists() else {}
+        )
         self.pairs: list[dict[str, str]] = []
         missing = 0
         for p in raw:
@@ -257,12 +316,21 @@ class ClapPrecomputedDataset(Dataset):
             feat = torch.load(str(clap_pt), map_location="cpu", weights_only=True)
         except Exception:
             return None
+        feats = feat["input_features"]
+        if self.augment:
+            feats = spec_augment(feats)
+
+        combo = pair.get("combo", "")
+        text  = pair["text"]
+        if self.augment and combo and combo in self.labels:
+            text = random.choice(self.labels[combo])
+
         return {
             # keep the batch dim (1, …) — collate_precomputed_fn cats along dim 0
-            "input_features": feat["input_features"],
+            "input_features": feats,
             "is_longer":      feat["is_longer"],
-            "text":       pair["text"],
-            "combo":      pair.get("combo", ""),
+            "text":       text,
+            "combo":      combo,
             "audio_path": pair["audio"],
         }
 
@@ -351,9 +419,12 @@ def contrastive_loss(
     log_scale: Tensor,
     combos: list[str],
     audio_paths: list[str],
+    combo_weights: dict[str, float] | None = None,
+    combo_hard_negs: dict[str, set] | None = None,
 ) -> Tensor:
     """
-    Multi-positive symmetric InfoNCE.
+    Multi-positive symmetric InfoNCE with optional dataset-level combo weighting
+    and hard negative boosting.
 
     Both embeddings are assumed already L2-normalised. Instead of treating only
     the diagonal as positive (which causes false negatives when two clips from the
@@ -364,6 +435,15 @@ def contrastive_loss(
 
     Soft cross-entropy with these targets avoids penalising the model for
     correctly aligning clips that are genuinely interchangeable.
+
+    combo_weights: pre-computed {combo: inverse_frequency} from the full training
+    set (not from the batch). When provided, rare combos get higher per-sample
+    weight so they contribute equally to the gradient regardless of class size.
+    Weights are normalised within the batch to keep the loss scale stable.
+
+    combo_hard_negs: {combo: set of same-genus different-species combos}.
+    When provided, logits between hard-negative pairs are boosted by 2×
+    before softmax, forcing the model to push confusable species apart harder.
 
     Falls back to standard diagonal loss when combo/path info is absent
     (e.g. old pair files without the "combo" field).
@@ -387,11 +467,38 @@ def contrastive_loss(
                 mask[i][j] = 1.0
     mask = mask.to(logits.device)
 
+    # Hard negative boost: same-genus different-species pairs get 2× logit weight
+    # so the model is penalised harder for confusing acoustically similar species.
+    if combo_hard_negs is not None:
+        boost = torch.ones(N, N, device=logits.device)
+        for i in range(N):
+            hard_set = combo_hard_negs.get(combos[i])
+            if hard_set:
+                for j in range(N):
+                    if combos[j] in hard_set and mask[i, j] == 0:
+                        boost[i, j] = 2.0
+        logits = logits * boost
+
     # Normalise rows → soft targets that sum to 1
     targets = mask / mask.sum(dim=1, keepdim=True).clamp(min=1.0)
 
-    loss_a = -(targets   * F.log_softmax(logits,   dim=1)).sum(dim=1).mean()
-    loss_t = -(targets.T * F.log_softmax(logits.T, dim=1)).sum(dim=1).mean()
+    loss_per_row_a = -(targets   * F.log_softmax(logits,   dim=1)).sum(dim=1)
+    loss_per_row_t = -(targets.T * F.log_softmax(logits.T, dim=1)).sum(dim=1)
+
+    if combo_weights is not None:
+        # Dataset-level inverse-frequency weights: rare combos weighted up.
+        # Normalise within the batch so the loss scale is independent of weight magnitude.
+        w = torch.tensor(
+            [combo_weights.get(c, 1.0) for c in combos],
+            dtype=torch.float32, device=logits.device,
+        )
+        w = w / w.sum().clamp(min=1e-8)
+        loss_a = (w * loss_per_row_a).sum()
+        loss_t = (w * loss_per_row_t).sum()
+    else:
+        loss_a = loss_per_row_a.mean()
+        loss_t = loss_per_row_t.mean()
+
     return (loss_a + loss_t) / 2.0
 
 
@@ -499,6 +606,40 @@ def load_checkpoint(
     return ckpt["epoch"], ckpt["best_val_loss"]
 
 
+# ── mixup ─────────────────────────────────────────────────────────────────────
+
+def apply_mixup(
+    features: "Tensor",
+    combos: list[str],
+    alpha: float = 0.4,
+) -> "Tensor":
+    """
+    Within-combo mixup: for each same-(species,type) pair in the batch, blend
+    one sample's input_features with another using lambda ~ Beta(alpha, alpha).
+
+    Only mixes within the same combo so the contrastive positive mask stays valid —
+    the mixed clip still belongs to the same species+type group.
+    Operates on mel spectrogram tensors (works for both precomputed and raw paths,
+    since both produce input_features by the time train_one_epoch sees the batch).
+    """
+    features = features.clone()
+    combo_indices: dict[str, list[int]] = {}
+    for i, c in enumerate(combos):
+        if c:
+            combo_indices.setdefault(c, []).append(i)
+
+    for indices in combo_indices.values():
+        if len(indices) < 2:
+            continue
+        random.shuffle(indices)
+        for k in range(0, len(indices) - 1, 2):
+            i, j = indices[k], indices[k + 1]
+            lam = float(np.random.beta(alpha, alpha))
+            features[i] = lam * features[i] + (1.0 - lam) * features[j]
+
+    return features
+
+
 # ── training loop ──────────────────────────────────────────────────────────────
 
 def train_one_epoch(
@@ -511,6 +652,9 @@ def train_one_epoch(
     accum_steps: int,
     epoch: int,
     use_amp: bool,
+    combo_weights: dict[str, float] | None = None,
+    combo_hard_negs: dict[str, set] | None = None,
+    mixup_alpha: float = 0.0,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -527,6 +671,12 @@ def train_one_epoch(
         combos = meta.get("combos", [])
         paths  = meta.get("audio_paths", [])
 
+        # Within-combo mixup on mel spectrograms (after device transfer)
+        if mixup_alpha > 0 and batch.get("input_features") is not None:
+            batch["input_features"] = apply_mixup(
+                batch["input_features"], combos, alpha=mixup_alpha
+            )
+
         with torch.autocast(device_type=device.type, enabled=use_amp):
             audio_feat = model.get_audio_features(
                 input_features = batch.get("input_features"),
@@ -539,7 +689,8 @@ def train_one_epoch(
 
             a_emb = F.normalize(audio_feat.pooler_output, dim=-1)
             t_emb = F.normalize(text_feat.pooler_output,  dim=-1)
-            loss  = contrastive_loss(a_emb, t_emb, model.logit_scale_a, combos, paths)
+            loss  = contrastive_loss(a_emb, t_emb, model.logit_scale_a, combos, paths,
+                                     combo_weights, combo_hard_negs)
             loss  = loss / accum_steps
 
         scaler.scale(loss).backward()
@@ -565,6 +716,8 @@ def validate(
     loader: DataLoader,
     device: torch.device,
     use_amp: bool,
+    combo_weights: dict[str, float] | None = None,
+    combo_hard_negs: dict[str, set] | None = None,
 ) -> float:
     model.eval()
     total_loss = 0.0
@@ -588,7 +741,8 @@ def validate(
             )
             a_emb = F.normalize(audio_feat.pooler_output, dim=-1)
             t_emb = F.normalize(text_feat.pooler_output,  dim=-1)
-            loss  = contrastive_loss(a_emb, t_emb, model.logit_scale_a, combos, paths)
+            loss  = contrastive_loss(a_emb, t_emb, model.logit_scale_a, combos, paths,
+                                     combo_weights, combo_hard_negs)
         total_loss += loss.item()
         n_batches  += 1
 
@@ -702,10 +856,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=str(root / "checkpoints"),
         help="Directory for checkpoints (default: checkpoints/)",
     )
+    ap.add_argument(
+        "--labels",
+        default=str(root / "data" / "clap_all_labels.json"),
+        help="Path to clap_all_labels.json for text augmentation (default: data/clap_all_labels.json)",
+    )
+    ap.add_argument(
+        "--taxonomy",
+        default=str(root / "data" / "species_taxonomy.json"),
+        help="Path to species_taxonomy.json for hard negative genus lookup",
+    )
     ap.add_argument("--epochs",       type=int,   default=10,    help="Training epochs (default 10)")
-    ap.add_argument("--batch-size",   type=int,   default=8,     help="Per-GPU batch size (default 8)")
+    ap.add_argument("--batch-size",   type=int,   default=16,
+                    help="Per-GPU batch size (default 16; drop to 8 if OOM — "
+                         "more in-batch negatives = stronger contrastive signal)")
     ap.add_argument("--accum",        type=int,   default=8,     help="Gradient accumulation steps (default 8 -> effective batch 64)")
-    ap.add_argument("--lr",           type=float, default=2e-5,  help="Peak learning rate (default 2e-5)")
+    ap.add_argument("--lr",           type=float, default=2e-5,  help="Peak learning rate for projection heads (default 2e-5)")
+    ap.add_argument("--lr-audio-mult", type=float, default=0.1,
+                    help="Audio encoder LR multiplier relative to --lr (default 0.1 → audio gets 2e-6)")
+    ap.add_argument("--lr-text-mult",  type=float, default=0.5,
+                    help="Text encoder LR multiplier relative to --lr (default 0.5 → text gets 1e-5)")
     ap.add_argument("--warmup-steps", type=int,   default=200,   help="LR warmup steps (default 200)")
     ap.add_argument("--workers",      type=int,   default=default_workers(), help="DataLoader worker processes (default auto)")
     ap.add_argument("--prefetch-factor", type=int, default=2,    help="DataLoader prefetch factor when workers > 0 (default 2)")
@@ -713,6 +883,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument(
         "--freeze-text-epochs", type=int, default=1,
         help="Freeze the text encoder for this many epochs at the start (default 1)",
+    )
+    ap.add_argument(
+        "--freeze-logscale-epochs", type=int, default=2,
+        help="Freeze logit_scale_a/t for this many epochs — prevents temperature "
+             "collapsing to extreme values before embeddings stabilise (default 2)",
     )
     ap.add_argument(
         "--no-amp", action="store_true",
@@ -751,6 +926,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Force raw-audio path even if .clap.pt sidecars exist (for debugging)",
     )
+    ap.add_argument(
+        "--no-augment",
+        action="store_true",
+        help="Disable training augmentation (random crop, noise/gain, SpecAugment). "
+             "Val set is never augmented regardless.",
+    )
+    ap.add_argument(
+        "--mixup-alpha", type=float, default=0.4,
+        help="Beta distribution alpha for within-combo mixup (default 0.4; 0 to disable). "
+             "Blends same-species mel spectrograms — keeps positive mask valid.",
+    )
     return ap.parse_args(argv)
 
 
@@ -786,7 +972,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Model:        {args.model}")
     print(f"Audio root:   {args.audio_root}")
     print(f"Batch size:   {args.batch_size}  x  accum {args.accum}  =  effective {args.batch_size * args.accum}")
-    print(f"Epochs:       {args.epochs}  |  LR: {args.lr}  |  warmup: {args.warmup_steps}")
+    print(f"Epochs:       {args.epochs}  |  LR: {args.lr} "
+          f"(audio ×{args.lr_audio_mult}={args.lr*args.lr_audio_mult:.2e}, "
+          f"text ×{args.lr_text_mult}={args.lr*args.lr_text_mult:.2e})  |  warmup: {args.warmup_steps}")
     print(
         f"Workers:      {args.workers}  |  prefetch: {args.prefetch_factor}  |  "
         f"persistent: {'off' if args.no_persistent_workers else 'on'}"
@@ -826,19 +1014,92 @@ def main(argv: list[str] | None = None) -> int:
                 f"Run scripts/precompute_clap_features.py to enable the fast path."
             )
 
+    do_augment  = not args.no_augment
+    labels_path = Path(args.labels) if Path(args.labels).exists() else None
+    if labels_path:
+        print(f"  Text augmentation: label pool from {labels_path}")
+    else:
+        print(f"  [warn] Labels file not found at {args.labels} — text augmentation disabled")
+
     if use_precomputed:
-        train_ds = ClapPrecomputedDataset(Path(args.train_pairs), audio_root)
-        val_ds   = ClapPrecomputedDataset(Path(args.val_pairs),   audio_root)
+        train_ds = ClapPrecomputedDataset(Path(args.train_pairs), audio_root,
+                                          augment=do_augment, labels_path=labels_path)
+        val_ds   = ClapPrecomputedDataset(Path(args.val_pairs),   audio_root,
+                                          augment=False)
         _collate = partial(collate_precomputed_fn, tokenizer=processor.tokenizer)
     else:
-        train_ds = ClapPairDataset(Path(args.train_pairs), audio_root, clip_s=args.clip_s)
-        val_ds   = ClapPairDataset(Path(args.val_pairs),   audio_root, clip_s=args.clip_s)
+        train_ds = ClapPairDataset(Path(args.train_pairs), audio_root, clip_s=args.clip_s,
+                                   augment=do_augment, labels_path=labels_path)
+        val_ds   = ClapPairDataset(Path(args.val_pairs),   audio_root, clip_s=args.clip_s,
+                                   augment=False)
         _collate = partial(collate_fn, processor=processor, sr=TARGET_SR)
+
+    aug_desc = "off" if not do_augment else (
+        f"on (random crop, noise/gain, SpecAugment, text aug"
+        + (f", mixup α={args.mixup_alpha}" if args.mixup_alpha > 0 else "")
+        + ")"
+    )
+    print(f"  Augmentation: {aug_desc}")
 
     # Warm the OS page cache so epoch 0 is served from RAM, not disk.
     # For the pre-computed path this warms the .clap.pt files instead of WAVs.
     if not args.no_cache_warm:
         warm_file_cache(train_ds, val_ds, workers=max(args.workers, 4))
+
+    # ── dataset-level combo frequencies for weighted loss + sampler ───────────
+    # Count how many pairs each combo has in the training set.
+    from collections import Counter
+    combo_freq: Counter = Counter(
+        p.get("combo", "") for p in train_ds.pairs if p.get("combo")
+    )
+    total_combos = sum(combo_freq.values())
+    # Inverse-frequency weights, normalised so the mean weight == 1.
+    n_combos = len(combo_freq)
+    combo_weights: dict[str, float] = {
+        combo: (total_combos / (n_combos * count))
+        for combo, count in combo_freq.items()
+    } if combo_freq else {}
+
+    # WeightedRandomSampler: each training pair is sampled with probability
+    # proportional to its combo's inverse frequency, so rare combos appear as
+    # often as common ones in expectation each epoch.
+    sample_weights = torch.tensor(
+        [combo_weights.get(p.get("combo", ""), 1.0) for p in train_ds.pairs],
+        dtype=torch.float64,
+    )
+    weighted_sampler = WeightedRandomSampler(
+        weights     = sample_weights,
+        num_samples = len(train_ds),
+        replacement = True,
+    )
+    print(
+        f"  WeightedRandomSampler: {len(combo_freq)} combos, "
+        f"weight range [{sample_weights.min():.3f}, {sample_weights.max():.3f}]"
+    )
+
+    # ── hard negative lookup: same genus, different species ───────────────────
+    # combo_hard_negs[combo] = set of combos from same genus (≠ species).
+    # Used in contrastive_loss to boost logits for confusable pairs.
+    combo_hard_negs: dict[str, set] | None = None
+    tax_path = Path(args.taxonomy)
+    if tax_path.exists():
+        tax_db: dict = json.loads(tax_path.read_text(encoding="utf-8"))
+        genus_to_combos: dict[str, set[str]] = {}
+        for combo_key in combo_freq:
+            species_name = combo_key.split("||")[0]
+            genus = tax_db.get(species_name, {}).get("genus", "")
+            if genus:
+                genus_to_combos.setdefault(genus, set()).add(combo_key)
+        combo_hard_negs = {
+            combo: genus_to_combos[genus] - {combo}
+            for combo in combo_freq
+            for genus in [tax_db.get(combo.split("||")[0], {}).get("genus", "")]
+            if genus and len(genus_to_combos.get(genus, set())) > 1
+        }
+        n_with_hard_negs = sum(1 for v in combo_hard_negs.values() if v)
+        print(f"  Hard negatives: {n_with_hard_negs} combos have same-genus competitors")
+    else:
+        print(f"  [warn] Taxonomy not found at {tax_path} — hard negative boosting disabled")
 
     loader_kwargs: dict[str, Any] = {}
     if args.workers > 0:
@@ -848,7 +1109,7 @@ def main(argv: list[str] | None = None) -> int:
     train_loader = DataLoader(
         train_ds,
         batch_size  = args.batch_size,
-        shuffle     = True,
+        sampler     = weighted_sampler,   # replaces shuffle=True
         num_workers = args.workers,
         collate_fn  = _collate,
         pin_memory  = (device.type == "cuda"),
@@ -866,9 +1127,20 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # ── optimiser + scheduler ─────────────────────────────────────────────────
+    # Differential learning rates: audio encoder learns slower (already pretrained
+    # on AudioSet), text encoder learns at half speed, projection heads at full LR.
+    audio_params = list(model.audio_model.parameters())
+    text_params  = list(model.text_model.parameters())
+    other_ids    = {id(p) for p in audio_params} | {id(p) for p in text_params}
+    proj_params  = [p for p in model.parameters() if id(p) not in other_ids]
+
+    param_groups = [
+        {"params": audio_params, "lr": args.lr * args.lr_audio_mult},
+        {"params": text_params,  "lr": args.lr * args.lr_text_mult},
+        {"params": proj_params,  "lr": args.lr},
+    ]
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr           = args.lr,
+        param_groups,
         weight_decay = 1e-4,
         betas        = (0.9, 0.98),
     )
@@ -931,11 +1203,23 @@ def main(argv: list[str] | None = None) -> int:
             elif not freeze and epoch == args.freeze_text_epochs:
                 print(f"Epoch {epoch}: text encoder unfrozen.")
 
+        # Optional logit_scale freeze — keeps temperature stable while embeddings settle
+        if args.freeze_logscale_epochs > 0:
+            freeze_ls = epoch < args.freeze_logscale_epochs
+            model.logit_scale_a.requires_grad_(not freeze_ls)
+            if hasattr(model, "logit_scale_t"):
+                model.logit_scale_t.requires_grad_(not freeze_ls)
+            if freeze_ls and epoch == 0:
+                print(f"logit_scale frozen for first {args.freeze_logscale_epochs} epoch(s).")
+            elif not freeze_ls and epoch == args.freeze_logscale_epochs:
+                print(f"Epoch {epoch}: logit_scale unfrozen.")
+
         train_loss = train_one_epoch(
             model, train_loader, optimizer, scaler, scheduler,
-            device, args.accum, epoch, use_amp,
+            device, args.accum, epoch, use_amp, combo_weights, combo_hard_negs,
+            mixup_alpha=args.mixup_alpha,
         )
-        val_loss = validate(model, val_loader, device, use_amp)
+        val_loss = validate(model, val_loader, device, use_amp, combo_weights, combo_hard_negs)
         r1       = recall_at_1(model, val_loader, processor, device)
 
         elapsed = time.time() - t0
