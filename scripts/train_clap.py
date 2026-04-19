@@ -52,6 +52,7 @@ import argparse
 import json
 import math
 import os
+import random
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -96,7 +97,8 @@ def default_workers() -> int:
     return max(2, min(6, cpu_count // 2))
 
 
-def load_audio(path: Path, sr: int = TARGET_SR, clip_s: float = CLIP_DURATION_S) -> np.ndarray | None:
+def load_audio(path: Path, sr: int = TARGET_SR, clip_s: float = CLIP_DURATION_S,
+               augment: bool = False) -> np.ndarray | None:
     """
     Load MP3/WAV at `sr` Hz, mono.  Centre-crops or pads to `clip_s` seconds.
     Returns None when the file cannot be decoded or is too short.
@@ -122,7 +124,8 @@ def load_audio(path: Path, sr: int = TARGET_SR, clip_s: float = CLIP_DURATION_S)
             if len(y) < min_len:
                 return None
             if len(y) >= target_len:
-                start = (len(y) - target_len) // 2
+                max_start = len(y) - target_len
+                start = random.randint(0, max_start) if augment else max_start // 2
                 y = y[start : start + target_len]
             else:
                 y = np.pad(y, (0, target_len - len(y)))
@@ -140,8 +143,9 @@ def load_audio(path: Path, sr: int = TARGET_SR, clip_s: float = CLIP_DURATION_S)
         return None
 
     if len(y) >= target_len:
-        # Centre-crop
-        start = (len(y) - target_len) // 2
+        # Random crop during training, centre-crop otherwise
+        max_start = len(y) - target_len
+        start = random.randint(0, max_start) if augment else max_start // 2
         y = y[start : start + target_len]
     else:
         # Zero-pad on the right
@@ -168,14 +172,16 @@ class ClapPairDataset(Dataset):
         sr: int = TARGET_SR,
         clip_s: float = CLIP_DURATION_S,
         verbose: bool = True,
+        augment: bool = False,
     ) -> None:
         raw: list[dict[str, str]] = json.loads(
             pairs_path.read_text(encoding="utf-8")
         )
 
-        self.sr     = sr
-        self.clip_s = clip_s
-        self.root   = audio_root
+        self.sr      = sr
+        self.clip_s  = clip_s
+        self.root    = audio_root
+        self.augment = augment
 
         # Pre-filter to rows whose audio file actually exists on disk.
         # The waveform is loaded lazily in __getitem__ to keep RAM low.
@@ -199,15 +205,47 @@ class ClapPairDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any] | None:
         pair  = self.pairs[idx]
-        audio = load_audio(self.root / pair["audio"], self.sr, self.clip_s)
+        audio = load_audio(self.root / pair["audio"], self.sr, self.clip_s, self.augment)
         if audio is None:
             return None
+        if self.augment:
+            # Random gain: scale volume ±40% so model is invariant to recording level
+            audio = audio * random.uniform(0.6, 1.4)
+            # Gaussian noise: simulate low-SNR field recordings
+            audio = audio + np.random.randn(len(audio)).astype(np.float32) * 0.002
         return {
             "audio":      audio,
             "text":       pair["text"],
             "combo":      pair.get("combo", ""),   # species||type — may be absent in old pair files
             "audio_path": pair["audio"],
         }
+
+
+def spec_augment(
+    features: "Tensor",
+    time_mask_max: int = 100,
+    freq_mask_max: int = 16,
+    n_time_masks: int = 2,
+    n_freq_masks: int = 2,
+) -> "Tensor":
+    """
+    SpecAugment: randomly zero out time and frequency bands on a mel spectrogram.
+    Operates on the last two dims (..., freq, time) so it works regardless of
+    whether the leading batch/channel dims are present.
+    Compatible with ClapPrecomputedDataset (applied after loading .clap.pt).
+    """
+    x = features.clone()
+    freq_dim = x.shape[-2]
+    time_dim = x.shape[-1]
+    for _ in range(n_time_masks):
+        t = random.randint(1, max(1, min(time_mask_max, time_dim - 1)))
+        t0 = random.randint(0, time_dim - t)
+        x[..., :, t0 : t0 + t] = 0.0
+    for _ in range(n_freq_masks):
+        f = random.randint(1, max(1, min(freq_mask_max, freq_dim - 1)))
+        f0 = random.randint(0, freq_dim - f)
+        x[..., f0 : f0 + f, :] = 0.0
+    return x
 
 
 class ClapPrecomputedDataset(Dataset):
@@ -228,11 +266,13 @@ class ClapPrecomputedDataset(Dataset):
         pairs_path: Path,
         audio_root: Path,
         verbose: bool = True,
+        augment: bool = False,
     ) -> None:
         raw: list[dict[str, str]] = json.loads(
             pairs_path.read_text(encoding="utf-8")
         )
-        self.root = audio_root
+        self.root    = audio_root
+        self.augment = augment
         self.pairs: list[dict[str, str]] = []
         missing = 0
         for p in raw:
@@ -257,9 +297,12 @@ class ClapPrecomputedDataset(Dataset):
             feat = torch.load(str(clap_pt), map_location="cpu", weights_only=True)
         except Exception:
             return None
+        feats = feat["input_features"]
+        if self.augment:
+            feats = spec_augment(feats)
         return {
             # keep the batch dim (1, …) — collate_precomputed_fn cats along dim 0
-            "input_features": feat["input_features"],
+            "input_features": feats,
             "is_longer":      feat["is_longer"],
             "text":       pair["text"],
             "combo":      pair.get("combo", ""),
@@ -778,6 +821,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Force raw-audio path even if .clap.pt sidecars exist (for debugging)",
     )
+    ap.add_argument(
+        "--no-augment",
+        action="store_true",
+        help="Disable training augmentation (random crop, noise/gain, SpecAugment). "
+             "Val set is never augmented regardless.",
+    )
     return ap.parse_args(argv)
 
 
@@ -855,14 +904,17 @@ def main(argv: list[str] | None = None) -> int:
                 f"Run scripts/precompute_clap_features.py to enable the fast path."
             )
 
+    do_augment = not args.no_augment
     if use_precomputed:
-        train_ds = ClapPrecomputedDataset(Path(args.train_pairs), audio_root)
-        val_ds   = ClapPrecomputedDataset(Path(args.val_pairs),   audio_root)
+        train_ds = ClapPrecomputedDataset(Path(args.train_pairs), audio_root, augment=do_augment)
+        val_ds   = ClapPrecomputedDataset(Path(args.val_pairs),   audio_root, augment=False)
         _collate = partial(collate_precomputed_fn, tokenizer=processor.tokenizer)
     else:
-        train_ds = ClapPairDataset(Path(args.train_pairs), audio_root, clip_s=args.clip_s)
-        val_ds   = ClapPairDataset(Path(args.val_pairs),   audio_root, clip_s=args.clip_s)
+        train_ds = ClapPairDataset(Path(args.train_pairs), audio_root, clip_s=args.clip_s, augment=do_augment)
+        val_ds   = ClapPairDataset(Path(args.val_pairs),   audio_root, clip_s=args.clip_s, augment=False)
         _collate = partial(collate_fn, processor=processor, sr=TARGET_SR)
+
+    print(f"  Augmentation: {'on (random crop, noise/gain, SpecAugment)' if do_augment else 'off'}")
 
     # Warm the OS page cache so epoch 0 is served from RAM, not disk.
     # For the pre-computed path this warms the .clap.pt files instead of WAVs.
