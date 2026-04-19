@@ -63,7 +63,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
 from transformers import ClapModel, ClapProcessor
 
@@ -351,9 +351,10 @@ def contrastive_loss(
     log_scale: Tensor,
     combos: list[str],
     audio_paths: list[str],
+    combo_weights: dict[str, float] | None = None,
 ) -> Tensor:
     """
-    Multi-positive symmetric InfoNCE.
+    Multi-positive symmetric InfoNCE with optional dataset-level combo weighting.
 
     Both embeddings are assumed already L2-normalised. Instead of treating only
     the diagonal as positive (which causes false negatives when two clips from the
@@ -364,6 +365,11 @@ def contrastive_loss(
 
     Soft cross-entropy with these targets avoids penalising the model for
     correctly aligning clips that are genuinely interchangeable.
+
+    combo_weights: pre-computed {combo: inverse_frequency} from the full training
+    set (not from the batch). When provided, rare combos get higher per-sample
+    weight so they contribute equally to the gradient regardless of class size.
+    Weights are normalised within the batch to keep the loss scale stable.
 
     Falls back to standard diagonal loss when combo/path info is absent
     (e.g. old pair files without the "combo" field).
@@ -390,8 +396,23 @@ def contrastive_loss(
     # Normalise rows → soft targets that sum to 1
     targets = mask / mask.sum(dim=1, keepdim=True).clamp(min=1.0)
 
-    loss_a = -(targets   * F.log_softmax(logits,   dim=1)).sum(dim=1).mean()
-    loss_t = -(targets.T * F.log_softmax(logits.T, dim=1)).sum(dim=1).mean()
+    loss_per_row_a = -(targets   * F.log_softmax(logits,   dim=1)).sum(dim=1)
+    loss_per_row_t = -(targets.T * F.log_softmax(logits.T, dim=1)).sum(dim=1)
+
+    if combo_weights is not None:
+        # Dataset-level inverse-frequency weights: rare combos weighted up.
+        # Normalise within the batch so the loss scale is independent of weight magnitude.
+        w = torch.tensor(
+            [combo_weights.get(c, 1.0) for c in combos],
+            dtype=torch.float32, device=logits.device,
+        )
+        w = w / w.sum().clamp(min=1e-8)
+        loss_a = (w * loss_per_row_a).sum()
+        loss_t = (w * loss_per_row_t).sum()
+    else:
+        loss_a = loss_per_row_a.mean()
+        loss_t = loss_per_row_t.mean()
+
     return (loss_a + loss_t) / 2.0
 
 
@@ -511,6 +532,7 @@ def train_one_epoch(
     accum_steps: int,
     epoch: int,
     use_amp: bool,
+    combo_weights: dict[str, float] | None = None,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -539,7 +561,7 @@ def train_one_epoch(
 
             a_emb = F.normalize(audio_feat.pooler_output, dim=-1)
             t_emb = F.normalize(text_feat.pooler_output,  dim=-1)
-            loss  = contrastive_loss(a_emb, t_emb, model.logit_scale_a, combos, paths)
+            loss  = contrastive_loss(a_emb, t_emb, model.logit_scale_a, combos, paths, combo_weights)
             loss  = loss / accum_steps
 
         scaler.scale(loss).backward()
@@ -565,6 +587,7 @@ def validate(
     loader: DataLoader,
     device: torch.device,
     use_amp: bool,
+    combo_weights: dict[str, float] | None = None,
 ) -> float:
     model.eval()
     total_loss = 0.0
@@ -588,7 +611,7 @@ def validate(
             )
             a_emb = F.normalize(audio_feat.pooler_output, dim=-1)
             t_emb = F.normalize(text_feat.pooler_output,  dim=-1)
-            loss  = contrastive_loss(a_emb, t_emb, model.logit_scale_a, combos, paths)
+            loss  = contrastive_loss(a_emb, t_emb, model.logit_scale_a, combos, paths, combo_weights)
         total_loss += loss.item()
         n_batches  += 1
 
@@ -705,7 +728,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--epochs",       type=int,   default=10,    help="Training epochs (default 10)")
     ap.add_argument("--batch-size",   type=int,   default=8,     help="Per-GPU batch size (default 8)")
     ap.add_argument("--accum",        type=int,   default=8,     help="Gradient accumulation steps (default 8 -> effective batch 64)")
-    ap.add_argument("--lr",           type=float, default=2e-5,  help="Peak learning rate (default 2e-5)")
+    ap.add_argument("--lr",           type=float, default=2e-5,  help="Peak learning rate for projection heads (default 2e-5)")
+    ap.add_argument("--lr-audio-mult", type=float, default=0.1,
+                    help="Audio encoder LR multiplier relative to --lr (default 0.1 → audio gets 2e-6)")
+    ap.add_argument("--lr-text-mult",  type=float, default=0.5,
+                    help="Text encoder LR multiplier relative to --lr (default 0.5 → text gets 1e-5)")
     ap.add_argument("--warmup-steps", type=int,   default=200,   help="LR warmup steps (default 200)")
     ap.add_argument("--workers",      type=int,   default=default_workers(), help="DataLoader worker processes (default auto)")
     ap.add_argument("--prefetch-factor", type=int, default=2,    help="DataLoader prefetch factor when workers > 0 (default 2)")
@@ -786,7 +813,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Model:        {args.model}")
     print(f"Audio root:   {args.audio_root}")
     print(f"Batch size:   {args.batch_size}  x  accum {args.accum}  =  effective {args.batch_size * args.accum}")
-    print(f"Epochs:       {args.epochs}  |  LR: {args.lr}  |  warmup: {args.warmup_steps}")
+    print(f"Epochs:       {args.epochs}  |  LR: {args.lr} "
+          f"(audio ×{args.lr_audio_mult}={args.lr*args.lr_audio_mult:.2e}, "
+          f"text ×{args.lr_text_mult}={args.lr*args.lr_text_mult:.2e})  |  warmup: {args.warmup_steps}")
     print(
         f"Workers:      {args.workers}  |  prefetch: {args.prefetch_factor}  |  "
         f"persistent: {'off' if args.no_persistent_workers else 'on'}"
@@ -840,6 +869,37 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_cache_warm:
         warm_file_cache(train_ds, val_ds, workers=max(args.workers, 4))
 
+    # ── dataset-level combo frequencies for weighted loss + sampler ───────────
+    # Count how many pairs each combo has in the training set.
+    from collections import Counter
+    combo_freq: Counter = Counter(
+        p.get("combo", "") for p in train_ds.pairs if p.get("combo")
+    )
+    total_combos = sum(combo_freq.values())
+    # Inverse-frequency weights, normalised so the mean weight == 1.
+    n_combos = len(combo_freq)
+    combo_weights: dict[str, float] = {
+        combo: (total_combos / (n_combos * count))
+        for combo, count in combo_freq.items()
+    } if combo_freq else {}
+
+    # WeightedRandomSampler: each training pair is sampled with probability
+    # proportional to its combo's inverse frequency, so rare combos appear as
+    # often as common ones in expectation each epoch.
+    sample_weights = torch.tensor(
+        [combo_weights.get(p.get("combo", ""), 1.0) for p in train_ds.pairs],
+        dtype=torch.float64,
+    )
+    weighted_sampler = WeightedRandomSampler(
+        weights     = sample_weights,
+        num_samples = len(train_ds),
+        replacement = True,
+    )
+    print(
+        f"  WeightedRandomSampler: {len(combo_freq)} combos, "
+        f"weight range [{sample_weights.min():.3f}, {sample_weights.max():.3f}]"
+    )
+
     loader_kwargs: dict[str, Any] = {}
     if args.workers > 0:
         loader_kwargs["prefetch_factor"] = max(1, args.prefetch_factor)
@@ -848,7 +908,7 @@ def main(argv: list[str] | None = None) -> int:
     train_loader = DataLoader(
         train_ds,
         batch_size  = args.batch_size,
-        shuffle     = True,
+        sampler     = weighted_sampler,   # replaces shuffle=True
         num_workers = args.workers,
         collate_fn  = _collate,
         pin_memory  = (device.type == "cuda"),
@@ -866,9 +926,20 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # ── optimiser + scheduler ─────────────────────────────────────────────────
+    # Differential learning rates: audio encoder learns slower (already pretrained
+    # on AudioSet), text encoder learns at half speed, projection heads at full LR.
+    audio_params = list(model.audio_model.parameters())
+    text_params  = list(model.text_model.parameters())
+    other_ids    = {id(p) for p in audio_params} | {id(p) for p in text_params}
+    proj_params  = [p for p in model.parameters() if id(p) not in other_ids]
+
+    param_groups = [
+        {"params": audio_params, "lr": args.lr * args.lr_audio_mult},
+        {"params": text_params,  "lr": args.lr * args.lr_text_mult},
+        {"params": proj_params,  "lr": args.lr},
+    ]
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr           = args.lr,
+        param_groups,
         weight_decay = 1e-4,
         betas        = (0.9, 0.98),
     )
@@ -933,9 +1004,9 @@ def main(argv: list[str] | None = None) -> int:
 
         train_loss = train_one_epoch(
             model, train_loader, optimizer, scaler, scheduler,
-            device, args.accum, epoch, use_amp,
+            device, args.accum, epoch, use_amp, combo_weights,
         )
-        val_loss = validate(model, val_loader, device, use_amp)
+        val_loss = validate(model, val_loader, device, use_amp, combo_weights)
         r1       = recall_at_1(model, val_loader, processor, device)
 
         elapsed = time.time() - t0
