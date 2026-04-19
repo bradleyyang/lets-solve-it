@@ -8,3 +8,12 @@ checkpoints/
 # UTF-16 backups of logs (one-time conversion artifacts)
 training_run.log.utf16le.bak
 convert_wav.log.utf16le.bak
+
+# Frontend — dependencies and build output (never commit)
+web/node_modules/
+web/dist/
+web/.vite/
+
+# Optional local caches
+*.log
+npm-debug.log*
