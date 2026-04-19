@@ -30,6 +30,10 @@ Plots saved to results/figures/:
   8. rank_cdf.pdf                 — CDF of first-hit rank (full gallery range)
   9. delta_finetuned_vs_base.pdf  — Δmetric bar chart  (only with --also-base)
 
+Query strategies now return lists of texts; run_eval averages embeddings before
+computing similarity. The "all_variants" strategy uses all 8 label variants per
+combo (5 taxonomy + 3 rich) as an ensemble — free improvement at inference time.
+
 Usage:
     conda activate birdclap
 
@@ -64,7 +68,7 @@ AUDIO_SR              = 48_000
 CLIP_SECONDS          = 10
 MIN_DURATION_S        = 0.5  # match scripts/train_clap.py
 STRATEGY_ORDER        = ["name", "scientific", "chain", "sci_common", "chain_common",
-                         "rich", "rich_holdout"]
+                         "rich", "rich_holdout", "all_variants"]
 STRATEGY_LABELS       = {
     "name":         "Common name",
     "scientific":   "Scientific name",
@@ -73,6 +77,7 @@ STRATEGY_LABELS       = {
     "chain_common": "Chain + common",
     "rich":         "Rich description",
     "rich_holdout": "Rich (held-out)",
+    "all_variants": "Ensemble (all)",
 }
 
 
@@ -224,6 +229,12 @@ def retrieval_metrics(sim_row: np.ndarray,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_queries(combos, tax_db, all_labels, holdout_descs=None):
+    """
+    Returns strategies dict where each value is a list of query texts.
+    Single-text strategies use a one-element list; the ensemble strategy
+    uses all available variants. run_eval encodes all texts and averages
+    their embeddings before computing the similarity matrix.
+    """
     strategies = {s: {} for s in STRATEGY_ORDER}
     for name, vtype in combos:
         key = f"{name}||{vtype}"
@@ -238,29 +249,36 @@ def build_queries(combos, tax_db, all_labels, holdout_descs=None):
         chain   = " > ".join(p for p in [kingdom, phylum, cls, order, family, genus, sci] if p)
         vt = vtype.strip()
 
-        strategies["name"][(name, vtype)] = f"{name} {vt}"
+        # Individual strategies — single text wrapped in list
+        strategies["name"][(name, vtype)] = [f"{name} {vt}"]
         if sci:
-            strategies["scientific"][(name, vtype)]   = f"{sci} {vt}"
-            strategies["chain"][(name, vtype)]         = f"{chain} {vt}"
-            strategies["sci_common"][(name, vtype)]    = f"{sci}, {name} {vt}"
-            strategies["chain_common"][(name, vtype)]  = f"{chain}, {name} {vt}"
+            strategies["scientific"][(name, vtype)]   = [f"{sci} {vt}"]
+            strategies["chain"][(name, vtype)]         = [f"{chain} {vt}"]
+            strategies["sci_common"][(name, vtype)]    = [f"{sci}, {name} {vt}"]
+            strategies["chain_common"][(name, vtype)]  = [f"{chain}, {name} {vt}"]
 
-        # rich: LLM acoustic descriptions used in training (indices 5+)
-        # Rotate across variants so every combo uses a different description.
-        all_variants = all_labels.get(key, [])
-        rich_variants = all_variants[5:]  # indices 0-4 are taxonomy templates
+        all_label_variants = all_labels.get(key, [])
+        tax_templates = all_label_variants[:5]   # indices 0-4: taxonomy
+        rich_variants = all_label_variants[5:]   # indices 5+: LLM descriptions
+
+        # rich: single rotating acoustic description (trained on)
         if rich_variants:
             idx = hash(key) % len(rich_variants)
-            strategies["rich"][(name, vtype)] = rich_variants[idx]
+            strategies["rich"][(name, vtype)] = [rich_variants[idx]]
 
-        # rich_holdout: descriptions held back from training labels
-        # These are acoustic queries the model has NEVER seen — a fair test of
-        # whether it learned acoustic language vs memorising training text.
+        # rich_holdout: description held back from training — unseen acoustic query
         if holdout_descs:
             held = holdout_descs.get(key, [])
             if held:
                 idx = hash(key) % len(held)
-                strategies["rich_holdout"][(name, vtype)] = held[idx]
+                strategies["rich_holdout"][(name, vtype)] = [held[idx]]
+
+        # all_variants: ensemble of ALL available texts for this combo.
+        # At query time, all texts are encoded and their embeddings are averaged
+        # before computing similarity — free improvement, no retraining needed.
+        ensemble_texts = (tax_templates if sci else [f"{name} {vt}"]) + rich_variants
+        if ensemble_texts:
+            strategies["all_variants"][(name, vtype)] = ensemble_texts
 
     return strategies
 
@@ -346,12 +364,27 @@ def run_eval(model, processor, val_clips, clip_to_combo,
             print(f"  [{strategy}] no valid combos - skipping")
             continue
 
-        print(f"  [{strategy}] encoding {len(eval_combos)} queries ...")
-        query_texts = [q for _, q in eval_combos]
-        text_embs = []
-        for i in range(0, len(query_texts), 64):
-            text_embs.append(encode_text_batch(query_texts[i:i+64], processor, model, device))
-        text_matrix = torch.cat(text_embs, dim=0).numpy()
+        n_variants_avg = sum(len(q) for _, q in eval_combos) / len(eval_combos)
+        print(f"  [{strategy}] encoding {len(eval_combos)} queries "
+              f"(avg {n_variants_avg:.1f} texts/combo) ...")
+
+        # Flatten all per-combo texts into one list, encode in batches of 64,
+        # then fold back and average per-combo embeddings (re-normalised).
+        flat_texts = [t for _, q in eval_combos for t in q]
+        n_per_combo = [len(q) for _, q in eval_combos]
+        flat_embs = []
+        for i in range(0, len(flat_texts), 64):
+            flat_embs.append(encode_text_batch(flat_texts[i:i+64], processor, model, device))
+        flat_embs = torch.cat(flat_embs, dim=0)   # (total_texts, D)
+
+        # Average and re-normalise per combo
+        combo_embs = []
+        offset = 0
+        for n in n_per_combo:
+            mean_emb = flat_embs[offset : offset + n].mean(dim=0)
+            combo_embs.append(F.normalize(mean_emb, dim=0))
+            offset += n
+        text_matrix = torch.stack(combo_embs).numpy()   # (n_combos, D)
         sim_matrix  = text_matrix @ audio_matrix.T
 
         per_combo, all_pos_sims, all_neg_sims = [], [], []

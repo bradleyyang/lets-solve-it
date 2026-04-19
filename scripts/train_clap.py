@@ -606,6 +606,40 @@ def load_checkpoint(
     return ckpt["epoch"], ckpt["best_val_loss"]
 
 
+# ── mixup ─────────────────────────────────────────────────────────────────────
+
+def apply_mixup(
+    features: "Tensor",
+    combos: list[str],
+    alpha: float = 0.4,
+) -> "Tensor":
+    """
+    Within-combo mixup: for each same-(species,type) pair in the batch, blend
+    one sample's input_features with another using lambda ~ Beta(alpha, alpha).
+
+    Only mixes within the same combo so the contrastive positive mask stays valid —
+    the mixed clip still belongs to the same species+type group.
+    Operates on mel spectrogram tensors (works for both precomputed and raw paths,
+    since both produce input_features by the time train_one_epoch sees the batch).
+    """
+    features = features.clone()
+    combo_indices: dict[str, list[int]] = {}
+    for i, c in enumerate(combos):
+        if c:
+            combo_indices.setdefault(c, []).append(i)
+
+    for indices in combo_indices.values():
+        if len(indices) < 2:
+            continue
+        random.shuffle(indices)
+        for k in range(0, len(indices) - 1, 2):
+            i, j = indices[k], indices[k + 1]
+            lam = float(np.random.beta(alpha, alpha))
+            features[i] = lam * features[i] + (1.0 - lam) * features[j]
+
+    return features
+
+
 # ── training loop ──────────────────────────────────────────────────────────────
 
 def train_one_epoch(
@@ -620,6 +654,7 @@ def train_one_epoch(
     use_amp: bool,
     combo_weights: dict[str, float] | None = None,
     combo_hard_negs: dict[str, set] | None = None,
+    mixup_alpha: float = 0.0,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -635,6 +670,12 @@ def train_one_epoch(
         meta   = batch.get("meta", {})
         combos = meta.get("combos", [])
         paths  = meta.get("audio_paths", [])
+
+        # Within-combo mixup on mel spectrograms (after device transfer)
+        if mixup_alpha > 0 and batch.get("input_features") is not None:
+            batch["input_features"] = apply_mixup(
+                batch["input_features"], combos, alpha=mixup_alpha
+            )
 
         with torch.autocast(device_type=device.type, enabled=use_amp):
             audio_feat = model.get_audio_features(
@@ -826,8 +867,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Path to species_taxonomy.json for hard negative genus lookup",
     )
     ap.add_argument("--epochs",       type=int,   default=10,    help="Training epochs (default 10)")
-    ap.add_argument("--batch-size",   type=int,   default=8,
-                    help="Per-GPU batch size (default 8; try 16 if VRAM allows — "
+    ap.add_argument("--batch-size",   type=int,   default=16,
+                    help="Per-GPU batch size (default 16; drop to 8 if OOM — "
                          "more in-batch negatives = stronger contrastive signal)")
     ap.add_argument("--accum",        type=int,   default=8,     help="Gradient accumulation steps (default 8 -> effective batch 64)")
     ap.add_argument("--lr",           type=float, default=2e-5,  help="Peak learning rate for projection heads (default 2e-5)")
@@ -890,6 +931,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Disable training augmentation (random crop, noise/gain, SpecAugment). "
              "Val set is never augmented regardless.",
+    )
+    ap.add_argument(
+        "--mixup-alpha", type=float, default=0.4,
+        help="Beta distribution alpha for within-combo mixup (default 0.4; 0 to disable). "
+             "Blends same-species mel spectrograms — keeps positive mask valid.",
     )
     return ap.parse_args(argv)
 
@@ -988,7 +1034,12 @@ def main(argv: list[str] | None = None) -> int:
                                    augment=False)
         _collate = partial(collate_fn, processor=processor, sr=TARGET_SR)
 
-    print(f"  Augmentation: {'on (random crop, noise/gain, SpecAugment, text)' if do_augment else 'off'}")
+    aug_desc = "off" if not do_augment else (
+        f"on (random crop, noise/gain, SpecAugment, text aug"
+        + (f", mixup α={args.mixup_alpha}" if args.mixup_alpha > 0 else "")
+        + ")"
+    )
+    print(f"  Augmentation: {aug_desc}")
 
     # Warm the OS page cache so epoch 0 is served from RAM, not disk.
     # For the pre-computed path this warms the .clap.pt files instead of WAVs.
@@ -1166,6 +1217,7 @@ def main(argv: list[str] | None = None) -> int:
         train_loss = train_one_epoch(
             model, train_loader, optimizer, scaler, scheduler,
             device, args.accum, epoch, use_amp, combo_weights, combo_hard_negs,
+            mixup_alpha=args.mixup_alpha,
         )
         val_loss = validate(model, val_loader, device, use_amp, combo_weights, combo_hard_negs)
         r1       = recall_at_1(model, val_loader, processor, device)
