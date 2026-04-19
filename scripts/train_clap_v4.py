@@ -37,7 +37,7 @@ What's new vs. train_clap.py
 Other defaults changed from train_clap.py
    --epochs         20  (was 10;  ~10 min/epoch × 20 ≈ 3.5 h)
    --lr             5e-6 (was 2e-5; appropriate for warm-start continuation)
-   --warmup-steps   50  (was 200; shorter ramp when starting near convergence)
+   --warmup-steps   200 (gives Adam time to stabilize before hitting peak LR)
    --freeze-text-epochs 0 (was 1;  text encoder already adapted)
    Per-epoch checkpoints use Pareto-optimal snapshotting: an epoch is saved
    only if it is better than all kept snapshots on at least one metric
@@ -828,8 +828,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help="Gradient accumulation steps (default 16 → effective 128)")
     ap.add_argument("--lr",           type=float, default=5e-6,
                     help="Base learning rate (default 5e-6 for warm-start)")
-    ap.add_argument("--warmup-steps", type=int,   default=50,
-                    help="LR warmup steps (default 50; short ramp near convergence)")
+    ap.add_argument("--warmup-steps", type=int,   default=200,
+                    help="LR warmup steps (default 200; safe ramp for fresh optimizer)")
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--freeze-text-epochs", type=int, default=0,
                     help="Freeze text encoder for this many epochs (default 0; "
