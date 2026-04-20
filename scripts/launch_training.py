@@ -8,14 +8,22 @@ itself write all training output to the log file in UTF-8.
 Usage (from repo root):
     python scripts/launch_training.py [extra train_clap.py args...]
 
-Example resume:
-    python scripts/launch_training.py \
-        --checkpoint-dir checkpoints/second-fine-tune \
-        --resume checkpoints/second-fine-tune/latest.pt \
-        --workers 8 --lr 2e-5 --warmup-steps 500 --freeze-text-epochs 2
+Example fresh run:
+    python scripts/launch_training.py --checkpoint-dir checkpoints/run6 --workers 4
 
-The log file is determined by TRAINING_LOG env var or defaults to
-training_run_second_fine_tune.log in the repo root.
+Example warm-start from previous run:
+    python scripts/launch_training.py \
+        --checkpoint-dir checkpoints/run7 \
+        --finetune-from  checkpoints/run6/best.pt \
+        --lr 1e-5 --workers 4
+
+Example full resume (continue same run):
+    python scripts/launch_training.py \
+        --checkpoint-dir checkpoints/run6 \
+        --resume checkpoints/run6/latest.pt
+
+The log file is set via TRAINING_LOG env var (recommended) or defaults to
+training.log in the repo root.
 """
 
 from __future__ import annotations
@@ -37,7 +45,7 @@ def main() -> None:
             pass
 
     repo_root = Path(__file__).resolve().parent.parent
-    log_path = Path(os.environ.get("TRAINING_LOG", repo_root / "training_run_second_fine_tune.log"))
+    log_path = Path(os.environ.get("TRAINING_LOG", repo_root / "training.log"))
 
     train_args = sys.argv[1:]  # everything after this script's name
 
