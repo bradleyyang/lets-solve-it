@@ -594,16 +594,118 @@ def save_checkpoint(
 def load_checkpoint(
     path: Path,
     model: ClapModel,
-    optimizer: torch.optim.Optimizer,
-    scaler: torch.cuda.amp.GradScaler,
-    scheduler: Any,
+    optimizer: torch.optim.Optimizer | None,
+    scaler: torch.cuda.amp.GradScaler | None,
+    scheduler: Any | None,
+    weights_only_mode: bool = False,
 ) -> tuple[int, float]:
-    ckpt = torch.load(path, map_location="cpu")
-    model.load_state_dict(ckpt["model_state"])
-    optimizer.load_state_dict(ckpt["optim_state"])
-    scaler.load_state_dict(ckpt["scaler_state"])
-    scheduler.load_state_dict(ckpt["scheduler_state"])
-    return ckpt["epoch"], ckpt["best_val_loss"]
+    """
+    Load a checkpoint.
+
+    weights_only_mode=True  (used with --finetune-from):
+        Loads only the model weights. Optimizer, scaler, and scheduler are
+        left at their initial states. Always starts from epoch 0 with fresh
+        Adam momentum — correct behaviour when continuing from a *different* run.
+
+    weights_only_mode=False (used with --resume):
+        Restores everything, continuing the exact same training run.
+    """
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    sd = ckpt.get("model_state",
+         ckpt.get("model_state_dict",
+         ckpt.get("state_dict", ckpt)))
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    if missing:
+        print(f"  [warn] {len(missing)} missing keys in checkpoint")
+    if unexpected:
+        print(f"  [warn] {len(unexpected)} unexpected keys in checkpoint")
+
+    if weights_only_mode:
+        return 0, float("inf")   # fresh start
+
+    if optimizer is not None:
+        optimizer.load_state_dict(ckpt["optim_state"])
+    if scaler is not None:
+        scaler.load_state_dict(ckpt["scaler_state"])
+    if scheduler is not None:
+        scheduler.load_state_dict(ckpt["scheduler_state"])
+    return ckpt["epoch"], ckpt.get("best_val_loss", float("inf"))
+
+
+# ── Pareto-optimal epoch checkpointing ────────────────────────────────────────
+
+class ParetoCheckpointManager:
+    """
+    Keeps only the Pareto-optimal set of per-epoch snapshots across three metrics:
+      - train_loss  (lower is better)
+      - val_loss    (lower is better)
+      - R@1         (higher is better)
+
+    An epoch is saved only if no existing snapshot is at least as good on every
+    metric AND strictly better on at least one. When a new epoch dominates older
+    snapshots, those files are deleted automatically. The snapshots directory
+    always contains exactly the Pareto front — no wasted disk space on long runs.
+    """
+
+    def __init__(self, checkpoint_dir: Path, subdir: str = "epochs") -> None:
+        self.ep_dir = checkpoint_dir / subdir
+        self.ep_dir.mkdir(parents=True, exist_ok=True)
+        self._kept: list[dict] = []
+
+    def _dominates(self, a: dict, b: dict) -> bool:
+        """True if a is at least as good as b on all metrics and strictly better on one."""
+        at_least = (
+            a["train_loss"] <= b["train_loss"] and
+            a["val_loss"]   <= b["val_loss"]   and
+            a["r1"]         >= b["r1"]
+        )
+        strictly = (
+            a["train_loss"] < b["train_loss"] or
+            a["val_loss"]   < b["val_loss"]   or
+            a["r1"]         > b["r1"]
+        )
+        return at_least and strictly
+
+    def consider(
+        self,
+        epoch: int,
+        train_loss: float,
+        val_loss: float,
+        r1: float,
+        model: ClapModel,
+        optimizer: torch.optim.Optimizer,
+        scaler: torch.cuda.amp.GradScaler,
+        scheduler: Any,
+        best_val_loss: float,
+    ) -> bool:
+        """Save snapshot if not dominated. Delete any now-dominated older snapshots.
+        Returns True if this epoch was saved."""
+        new = dict(epoch=epoch, train_loss=train_loss, val_loss=val_loss, r1=r1)
+
+        if any(self._dominates(k, new) for k in self._kept):
+            print(f"  [epoch {epoch:02d}] snapshot skipped — dominated on all metrics")
+            return False
+
+        path = self.ep_dir / f"epoch_{epoch:02d}.pt"
+        save_checkpoint(path, model, optimizer, scaler, scheduler, epoch, best_val_loss)
+        new["path"] = path
+
+        dominated = [k for k in self._kept if self._dominates(new, k)]
+        for d in dominated:
+            try:
+                d["path"].unlink(missing_ok=True)
+                print(f"  [epoch {epoch:02d}] removed dominated snapshot "
+                      f"epoch_{d['epoch']:02d}.pt "
+                      f"(tl={d['train_loss']:.4f} vl={d['val_loss']:.4f} r1={d['r1']:.4f})")
+            except Exception:
+                pass
+        self._kept = [k for k in self._kept if k not in dominated]
+        self._kept.append(new)
+
+        kept_str = ", ".join(f"ep{k['epoch']:02d}" for k in sorted(self._kept, key=lambda x: x["epoch"]))
+        print(f"  [epoch {epoch:02d}] snapshot saved  ->  {path.name}  "
+              f"| Pareto front: [{kept_str}]")
+        return True
 
 
 # ── mixup ─────────────────────────────────────────────────────────────────────
@@ -895,7 +997,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     ap.add_argument(
         "--resume", default=None, metavar="CHECKPOINT",
-        help="Resume from a checkpoint file produced by this script",
+        help="Full resume: restore model + optimiser + epoch counter",
+    )
+    ap.add_argument(
+        "--finetune-from", default=None, metavar="CHECKPOINT",
+        help="Warm-start: load model weights only, reset optimiser and epoch to 0. "
+             "Use when continuing from a *different* run's best.pt at a new LR "
+             "(avoids carrying over stale Adam momentum from the old run).",
     )
     ap.add_argument(
         "--no-epoch-checkpoints",
@@ -1160,35 +1268,52 @@ def main(argv: list[str] | None = None) -> int:
     # ── optional resume ───────────────────────────────────────────────────────
     start_epoch    = 0
     best_val_loss  = float("inf")
+
+    if args.resume and args.finetune_from:
+        print("WARNING: both --resume and --finetune-from supplied. "
+              "--resume takes precedence.", file=sys.stderr)
+
     if args.resume:
         resume_path = Path(args.resume)
         if resume_path.is_file():
-            print(f"\nResuming from {resume_path} ...")
+            print(f"\nFull resume from {resume_path} ...")
             start_epoch, best_val_loss = load_checkpoint(
-                resume_path, model, optimizer, scaler, scheduler
+                resume_path, model, optimizer, scaler, scheduler,
+                weights_only_mode=False,
             )
             start_epoch += 1
             if not math.isfinite(best_val_loss):
                 best_sidecar = ckpt_dir / "best.pt"
                 if best_sidecar.is_file():
-                    ck = torch.load(
-                        best_sidecar, map_location="cpu", weights_only=False
-                    )
+                    ck = torch.load(best_sidecar, map_location="cpu", weights_only=False)
                     bvl = ck.get("best_val_loss")
                     if bvl is not None and math.isfinite(float(bvl)):
                         best_val_loss = float(bvl)
-                        print(
-                            f"  -> best_val_loss from {best_sidecar.name}: "
-                            f"{best_val_loss:.4f} (resume ckpt had non-finite best)"
-                        )
+                        print(f"  -> best_val_loss from {best_sidecar.name}: "
+                              f"{best_val_loss:.4f} (resume ckpt had non-finite best)")
             print(f"  -> starting at epoch {start_epoch}, best_val_loss={best_val_loss:.4f}")
         else:
             print(f"Warning: checkpoint {resume_path} not found, starting fresh.", file=sys.stderr)
+    elif args.finetune_from:
+        ft_path = Path(args.finetune_from)
+        if ft_path.is_file():
+            print(f"\nWarm-start: loading model weights from {ft_path} ...")
+            load_checkpoint(ft_path, model, None, None, None, weights_only_mode=True)
+            print(f"  -> model weights loaded; optimiser reset to fresh state.")
+            print(f"  -> training starts at epoch 0 with lr={args.lr:.1e}")
+        else:
+            print(f"Warning: --finetune-from checkpoint not found: {ft_path}", file=sys.stderr)
 
     # ── training ──────────────────────────────────────────────────────────────
     print(f"\n{'-' * 60}")
     print(f"Starting training   ({len(train_ds):,} train  |  {len(val_ds):,} val pairs)")
+    print(f"Epoch snapshots:    "
+          + ("disabled" if args.no_epoch_checkpoints
+             else "Pareto-optimal (saved only if best on ≥1 metric)"))
     print(f"{'-' * 60}\n")
+
+    pareto = (None if args.no_epoch_checkpoints
+              else ParetoCheckpointManager(ckpt_dir, args.epoch_checkpoints_subdir))
 
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
@@ -1245,14 +1370,12 @@ def main(argv: list[str] | None = None) -> int:
             model, optimizer, scaler, scheduler, epoch, best_val_loss,
         )
 
-        if not args.no_epoch_checkpoints:
-            epoch_dir = ckpt_dir / args.epoch_checkpoints_subdir
-            epoch_path = epoch_dir / f"epoch_{epoch:02d}.pt"
-            save_checkpoint(
-                epoch_path,
-                model, optimizer, scaler, scheduler, epoch, best_val_loss,
+        if pareto is not None:
+            pareto.consider(
+                epoch=epoch, train_loss=train_loss, val_loss=val_loss, r1=r1,
+                model=model, optimizer=optimizer, scaler=scaler,
+                scheduler=scheduler, best_val_loss=best_val_loss,
             )
-            print(f"  saved epoch snapshot  ->  {epoch_path}")
 
     print(f"\nTraining complete.  Best val loss: {best_val_loss:.4f}")
     print(f"Checkpoints: {ckpt_dir.resolve()}")
