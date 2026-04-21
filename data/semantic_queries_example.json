@@ -1,0 +1,39 @@
+[
+  {
+    "_comment": "Format: each entry is one hand-written acoustic query with its positive combos.",
+    "_format":  "positive_combos uses 'CommonName||voc_type' matching xc_metadata_unified.csv",
+    "_rule":    "Queries MUST NOT contain species names, genus names, or taxonomy — purely acoustic."
+  },
+  {
+    "query": "a clear, rising two-note whistle, second note higher and sustained",
+    "positive_combos": []
+  },
+  {
+    "query": "rapid, descending trill that slows at the end, high-pitched and thin",
+    "positive_combos": []
+  },
+  {
+    "query": "loud, fluty song with long melodic phrases, rich tonal quality and varied pitch contour",
+    "positive_combos": []
+  },
+  {
+    "query": "sharp, high-frequency chip note repeated at irregular intervals",
+    "positive_combos": []
+  },
+  {
+    "query": "buzzy, nasal call with a slight downward inflection, mid-range frequency",
+    "positive_combos": []
+  },
+  {
+    "query": "series of short, hollow tapping sounds in an irregular rhythm",
+    "positive_combos": []
+  },
+  {
+    "query": "slow, mournful cooing with evenly spaced repetitions, low fundamental frequency",
+    "positive_combos": []
+  },
+  {
+    "query": "very high, thin, wavering whistle sustained for over a second, nearly pure tone",
+    "positive_combos": []
+  }
+]

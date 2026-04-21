@@ -83,16 +83,31 @@ Outputs:
 - `data/clap_val_pairs.json`   — held-out val set (no audio overlap with train)
 
 ### Step 6 — Fine-tune CLAP
+
 ```bash
-python scripts/train_clap.py
+# Fresh run
+python scripts/launch_training.py --checkpoint-dir checkpoints/run7 --workers 4
+
+# Warm-start from previous run (reset optimizer, new LR)
+python scripts/launch_training.py \
+    --checkpoint-dir checkpoints/run7 \
+    --finetune-from  checkpoints/run6/best.pt \
+    --lr 1e-5 --workers 4
+
+# Full resume (continue same run)
+python scripts/launch_training.py \
+    --checkpoint-dir checkpoints/run6 \
+    --resume checkpoints/run6/latest.pt
 ```
-Saves checkpoints to `checkpoints/`. See `--help` for batch size, learning rate, etc.
+
+Key flags: `--batch-size` (default 16), `--epochs` (default 20), `--lr` (default 2e-5), `--workers`.  
+Run `python scripts/train_clap.py --help` for the full list.
 
 ---
 
 ## Evaluation
 
-Evaluates retrieval performance on the held-out val set across 6 query strategies:
+Evaluates text-to-audio retrieval on the held-out val set across 8 query strategies:
 
 | Strategy | Example query |
 |---|---|
@@ -101,55 +116,61 @@ Evaluates retrieval performance on the held-out val set across 6 query strategie
 | `chain` | `"Animalia > Chordata > Aves > ... call"` |
 | `sci_common` | `"Cardinalis cardinalis, Northern Cardinal call"` |
 | `chain_common` | `"Animalia > ... > Cardinalis cardinalis, Northern Cardinal call"` |
-| `rich` | LLM-generated acoustic description |
+| `rich` | LLM-generated acoustic description (one variant) |
+| `rich_holdout` | Held-out description not seen during training |
+| `all_variants` | Ensemble of all 8 label variants per combo (free inference improvement) |
 
 ```bash
-# Second fine-tune best checkpoint (recommended)
-python scripts/evaluate_clap.py --checkpoint checkpoints/second-fine-tune/best.pt --metadata scripts/xc_metadata_unified.csv --audio-root scripts/data/xc_audio
-
-# Final run checkpoint (epoch 09)
-python scripts/evaluate_clap.py --checkpoint checkpoints/latest.pt
-
-# Evaluate a specific epoch snapshot
-python scripts/evaluate_clap.py --checkpoint checkpoints/epochs/epoch_09.pt
+# Fine-tuned checkpoint
+python scripts/evaluate_clap.py --checkpoint checkpoints/run6/best.pt
 
 # Fine-tuned vs base model (zero-shot baseline)
-python scripts/evaluate_clap.py --checkpoint checkpoints/latest.pt --also-base
+python scripts/evaluate_clap.py --checkpoint checkpoints/run6/best.pt --also-base
 
 # Base model only (zero-shot)
 python scripts/evaluate_clap.py
+
+# Full semantic eval suite (requires hand-written query file)
+python scripts/evaluate_clap.py --checkpoint checkpoints/run6/best.pt \
+    --semantic-queries data/semantic_queries_example.json \
+    --acoustic-coherence \
+    --cross-species-eval
 ```
 
 ### Outputs
 
-**Console** — metric table (mAP, MRR, R@1, R@5, R@10 per strategy) and delta table if both models evaluated.
+**Console** — metric table (mAP, MRR, R@1, R@5, R@10, MedRank per strategy) plus delta table when both models evaluated.
 
-**`results/eval_results.json`** — full per-query metrics for every (species, type) combo.
+**`results/eval_results.json`** — per-query metrics for every (species, type) combo + semantic eval summaries.
 
-**`results/figures/`** — PDF plots:
+**`results/figures/`** — PDF plots (5 core + up to 3 semantic):
 
 | File | Description |
 |---|---|
-| `strategy_comparison.pdf` | Grouped bar chart of mAP / MRR / R@K per query strategy |
-| `recall_at_k.pdf` | R@K curves from K=1→20, one line per strategy |
-| `map_distribution_{model}.pdf` | Violin plot of per-query mAP — shows variance across species |
-| `class_breakdown_{model}.pdf` | mAP broken down by taxonomic class (Aves, Mammalia, Amphibia, Insecta) |
-| `similarity_distribution_{model}.pdf` | Positive vs negative cosine similarity distributions with Δμ |
-| `hardest_easiest_{model}.pdf` | Top 20 hardest and easiest species to retrieve |
-| `delta_finetuned_vs_base.pdf` | Per-strategy Δmetric (fine-tuned − base), only with `--also-base` |
+| `strategy_comparison.pdf` | mAP / MRR / R@1/5/10 bar chart per strategy |
+| `class_breakdown_{model}.pdf` | mAP by taxonomic class × strategy |
+| `hardest_easiest_{model}.pdf` | Top-20 hardest and easiest species |
+| `rank_cdf_{model}.pdf` | CDF of first-hit rank across the full gallery |
+| `delta_finetuned_vs_base.pdf` | Δmetric (fine-tuned − base), only with `--also-base` |
+| `semantic_probe_{model}.pdf` | R@K per hand-written acoustic query (`--semantic-queries`) |
+| `acoustic_coherence_{model}.pdf` | Genus/family neighbour recall in text-embedding space (`--acoustic-coherence`) |
+| `cross_species_transfer_{model}.pdf` | Description transfer R@K by genus (`--cross-species-eval`) |
 
-### Latest completed run (second fine-tune, epochs 0-9)
+### Semantic search evaluations
 
-- Training reached the configured 10 epochs (00 through 09) in `checkpoints/second-fine-tune/`.
-- Best validation loss: epoch 07 (`checkpoints/second-fine-tune/best.pt`, `val_loss=0.6520`).
-- Final checkpoint (`checkpoints/second-fine-tune/latest.pt`) at epoch 09:
-  - train loss 0.0321
-  - val loss 0.6736
-  - R@1 0.4471
-- Fresh retrieval evaluation artifacts (best checkpoint vs base):
-  - `results/eval_results_second_fine_tune_best.json`
-  - `results/figures_second_fine_tune_best/`
-- Dedicated audit document:
-  - `TRAINING_AUDIT_SECOND_FINE_TUNE.md`
+Three opt-in evaluations probe whether the model learned *acoustic* semantics rather than species identity:
+
+- **`--semantic-queries data/semantic_queries_example.json`** — hand-written purely-acoustic queries (no species names) evaluated against the full gallery. Edit the example file to add real positive combos for your data.
+- **`--acoustic-coherence`** — encodes one rich acoustic description per combo and checks whether top-K nearest neighbours in text-embedding space share the same genus/family. Genus R@K >> random → model learned acoustic structure.
+- **`--cross-species-eval`** — uses species A's acoustic description to retrieve species B's audio (same genus, different species). Above-random R@K → transferable acoustic features learned.
+
+### Run history
+
+| Run | Epochs | Notes |
+|---|---|---|
+| run 1–2 | — | Initial experiments |
+| run 3–4 | — | Dataset and label improvements |
+| run 5 | 20 | Low LR (audio encoder effectively frozen at 5e-7) |
+| run 6 | ongoing | Differential LR, WeightedRandomSampler, SpecAugment, hard negative boosting, mixup, ensemble eval, logit_scale freeze, ParetoCheckpointManager |
 
 

@@ -20,19 +20,35 @@ Six query strategies:
   6. rich          LLM-generated acoustic description (first variant)
 
 Plots saved to results/figures/:
-  1. strategy_comparison.pdf      — mAP / MRR / R@K bar chart per strategy
-  2. recall_at_k.pdf              — R@K curve (K=1..20) per strategy
-  3. map_distribution.pdf         — violin plot of per-combo mAP per strategy
-  4. class_breakdown.pdf          — mAP by taxonomic class × strategy
-  5. similarity_distribution.pdf  — KDE of positive vs negative cosine sim
-  6. hardest_easiest.pdf          — top-20 hardest / easiest species by mAP
-  7. rank_distribution.pdf        — histogram of first-hit rank per strategy
-  8. rank_cdf.pdf                 — CDF of first-hit rank (full gallery range)
-  9. delta_finetuned_vs_base.pdf  — Δmetric bar chart  (only with --also-base)
+  1. strategy_comparison.pdf          — mAP / MRR / R@K bar chart per strategy
+  2. class_breakdown_{model}.pdf      — mAP by taxonomic class × strategy
+  3. hardest_easiest_{model}.pdf      — top-20 hardest / easiest species by mAP
+  4. rank_cdf_{model}.pdf             — CDF of first-hit rank (full gallery range)
+  5. delta_finetuned_vs_base.pdf      — Δmetric bar chart  (only with --also-base)
+  Semantic (opt-in, one file per model):
+  6. semantic_probe_{model}.pdf       — R@K per hand-written acoustic query
+  7. acoustic_coherence_{model}.pdf   — genus/family R@K vs random baseline
+  8. cross_species_transfer_{m}.pdf   — description transfer R@K by genus
+
+Semantic search evaluations (opt-in):
+  --semantic-queries data/my_queries.json
+      Evaluate hand-written purely-acoustic queries (no species names) against
+      the full gallery. See data/semantic_queries_example.json for format.
+  --acoustic-coherence
+      Encodes one rich acoustic description per combo, measures whether top-K
+      nearest neighbours in text-embedding space share the same genus/family.
+      Genus R@K >> random baseline proves the model learned acoustic structure.
+  --cross-species-eval
+      Uses species A's acoustic description to retrieve species B's audio
+      (same genus, different species). Above-random R@K means the model
+      learned transferable acoustic properties beyond species identity.
 
 Query strategies now return lists of texts; run_eval averages embeddings before
 computing similarity. The "all_variants" strategy uses all 8 label variants per
 combo (5 taxonomy + 3 rich) as an ensemble — free improvement at inference time.
+
+Audio gallery is encoded once per model and reused across all eval functions
+(encode_gallery is called once inside evaluate(), not separately per eval).
 
 Usage:
     conda activate birdclap
@@ -40,6 +56,12 @@ Usage:
     python scripts/evaluate_clap.py --checkpoint checkpoints/best.pt
     python scripts/evaluate_clap.py --checkpoint checkpoints/best.pt --also-base
     python scripts/evaluate_clap.py          # base model only
+
+    # Full semantic eval suite
+    python scripts/evaluate_clap.py --checkpoint checkpoints/best.pt \
+        --semantic-queries data/semantic_queries_example.json \
+        --acoustic-coherence \
+        --cross-species-eval
 """
 
 import argparse
@@ -315,39 +337,65 @@ def load_model(checkpoint, base_model, device):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main evaluation
+# Gallery encoder (shared across all eval functions)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_eval(model, processor, val_clips, clip_to_combo,
-             strategies, audio_root, device, batch_size=16):
+def encode_gallery(model, processor, val_clips, audio_root, device, batch_size=16):
     """
+    Encode all val audio clips to normalised embeddings once.
+    Call this once per model and pass the result to run_eval / semantic evals
+    to avoid redundant encoding.
+
     Returns:
-        agg     : {strategy: {metric: float}}   — macro-averaged metrics
-        detail  : {strategy: [{combo, mAP, MRR, R@k, tax_class, ...}]}
-        sim_data: {strategy: {"pos": [...], "neg": [...]}}
+        audio_matrix : np.ndarray (N, D), L2-normalised
+        valid_clips  : list[str] — clips that loaded successfully (same order)
     """
-    # Encode audio
     print(f"\n  Encoding {len(val_clips)} val audio clips ...")
     audio_embs, failed = [], []
     for i in range(0, len(val_clips), batch_size):
-        batch_paths = val_clips[i: i + batch_size]
-        wavs, valid = [], []
+        batch_paths = val_clips[i : i + batch_size]
+        wavs = []
         for p in batch_paths:
             wav = load_audio(audio_root / p)
             if wav is not None:
-                wavs.append(wav); valid.append(p)
+                wavs.append(wav)
             else:
                 failed.append(p)
         if wavs:
             audio_embs.append(encode_audio_batch(wavs, processor, model, device))
         if (i // batch_size) % 10 == 0:
             print(f"    {min(i + batch_size, len(val_clips))}/{len(val_clips)}", end="\r")
-
     if failed:
         print(f"\n  [warn] {len(failed)} clips failed to load - excluded")
     valid_clips = [c for c in val_clips if c not in set(failed)]
-    print(f"\n  Audio encoding done.")
+    print(f"\n  Audio encoding done. ({len(valid_clips)} clips)")
     audio_matrix = torch.cat(audio_embs, dim=0).numpy()
+    return audio_matrix, valid_clips
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main evaluation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_eval(model, processor, val_clips, clip_to_combo,
+             strategies, audio_root, device, batch_size=16,
+             audio_matrix=None, valid_clips_in=None):
+    """
+    Returns:
+        agg     : {strategy: {metric: float}}   — macro-averaged metrics
+        detail  : {strategy: [{combo, mAP, MRR, R@k, tax_class, ...}]}
+        sim_data: {strategy: {"pos": [...], "neg": [...]}}
+
+    If audio_matrix + valid_clips_in are provided (from encode_gallery), audio
+    encoding is skipped. Otherwise encode_gallery is called internally.
+    """
+    # Encode audio (or reuse pre-encoded gallery)
+    if audio_matrix is not None and valid_clips_in is not None:
+        valid_clips = valid_clips_in
+        print(f"\n  [run_eval] using pre-encoded gallery ({len(valid_clips)} clips)")
+    else:
+        audio_matrix, valid_clips = encode_gallery(
+            model, processor, val_clips, audio_root, device, batch_size)
 
     combo_to_indices = defaultdict(list)
     for idx, clip in enumerate(valid_clips):
@@ -431,6 +479,285 @@ def run_eval(model, processor, val_clips, clip_to_combo,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Semantic search evaluations
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_semantic_probe(audio_matrix, valid_clips, clip_to_combo,
+                       model, processor, probe_queries, device, batch_size=64):
+    """
+    Evaluate hand-written purely-acoustic text queries against the full gallery.
+
+    probe_queries: list of dicts loaded from --semantic-queries JSON:
+        [{"query": "rising two-note whistle with a descending slur",
+          "positive_combos": ["American Robin||song"]}, ...]
+    The queries must NOT contain species names — they should describe only
+    acoustic properties so the eval is a true test of acoustic understanding.
+
+    Returns:
+        results : list of per-query metric dicts
+        summary : macro-averaged metric dict
+    """
+    if not probe_queries:
+        return [], {}
+
+    combo_to_indices: dict[tuple, list[int]] = defaultdict(list)
+    for idx, clip in enumerate(valid_clips):
+        combo = clip_to_combo.get(clip)
+        if combo:
+            combo_to_indices[combo].append(idx)
+
+    # Encode all probe texts in one pass
+    texts = [q["query"] for q in probe_queries]
+    flat_embs = []
+    for i in range(0, len(texts), batch_size):
+        flat_embs.append(encode_text_batch(texts[i : i + batch_size], processor, model, device))
+    text_matrix = torch.cat(flat_embs, dim=0).numpy()   # (n_queries, D)
+    sim_matrix  = text_matrix @ audio_matrix.T           # (n_queries, n_gallery)
+
+    results = []
+    for q_idx, probe in enumerate(probe_queries):
+        pos_indices: list[int] = []
+        for combo_str in probe.get("positive_combos", []):
+            if "||" in combo_str:
+                sp, vt = combo_str.split("||", 1)
+                pos_indices.extend(combo_to_indices.get((sp.strip(), vt.strip().lower()), []))
+        if not pos_indices:
+            print(f"    [semantic_probe] '{probe['query'][:60]}' — no positives found, skipped")
+            continue
+        m = retrieval_metrics(sim_matrix[q_idx], pos_indices)
+        results.append({
+            "query":          probe["query"],
+            "n_positives":    len(pos_indices),
+            "mAP":            m["mAP"],
+            "MRR":            m["MRR"],
+            "recall_at_k":    m["recall_at_k"],
+            "first_hit_rank": m["first_hit_rank"],
+        })
+
+    if not results:
+        return results, {}
+
+    fhr = [r["first_hit_rank"] for r in results if r["first_hit_rank"] > 0]
+    summary = {
+        "mAP":               float(np.mean([r["mAP"] for r in results])),
+        "MRR":               float(np.mean([r["MRR"] for r in results])),
+        "R@1":               float(np.mean([r["recall_at_k"][1] for r in results])),
+        "R@5":               float(np.mean([r["recall_at_k"][5] for r in results])),
+        "R@10":              float(np.mean([r["recall_at_k"][10] for r in results])),
+        "median_first_rank": float(np.median(fhr)) if fhr else float(len(valid_clips)),
+        "n_queries":         len(results),
+    }
+    n_gal = len(valid_clips)
+    print(f"  [semantic_probe] mAP={summary['mAP']:.3f}  "
+          f"R@1={summary['R@1']:.3f}  R@5={summary['R@5']:.3f}  "
+          f"median_rank={summary['median_first_rank']:.0f}/{n_gal}  "
+          f"({summary['n_queries']} queries)")
+    return results, summary
+
+
+def run_acoustic_coherence(model, processor, combos, tax_db, all_labels,
+                            device, batch_size=64, k_vals=(1, 5, 10)):
+    """
+    Measure whether the text embedding space has learned acoustic structure.
+
+    Encodes one rich acoustic description per (species, type) combo.  For each
+    combo, finds its K nearest neighbours in text-embedding space and reports
+    what fraction share the same genus / family vs a random-pick baseline.
+
+    If the model learned acoustics from descriptions, similar-sounding species
+    (congeneric ones are a decent proxy) should cluster together in embedding
+    space — genus_R@K >> random baseline.
+
+    Returns:
+        results : list of per-combo dicts
+        summary : {"genus_R@{k}": ..., "family_R@{k}": ...,
+                   "random_genus_R@{k}": ..., ...}
+    """
+    combo_texts: dict[tuple, str] = {}
+    for name, vtype in combos:
+        key   = f"{name}||{vtype}"
+        rich  = all_labels.get(key, [])[5:]
+        if rich:
+            combo_texts[(name, vtype)] = rich[hash(key) % len(rich)]
+
+    if len(combo_texts) < 10:
+        print(f"  [acoustic_coherence] only {len(combo_texts)} combos have rich descriptions — skipping")
+        return [], {}
+
+    combos_list = list(combo_texts.keys())
+    texts       = [combo_texts[c] for c in combos_list]
+    print(f"  [acoustic_coherence] encoding {len(texts)} acoustic descriptions ...")
+
+    flat_embs = []
+    for i in range(0, len(texts), batch_size):
+        flat_embs.append(encode_text_batch(texts[i : i + batch_size], processor, model, device))
+    emb_matrix = torch.cat(flat_embs, dim=0).numpy()   # (N, D) normalised
+
+    sim_matrix = emb_matrix @ emb_matrix.T             # (N, N) cosine similarity
+    np.fill_diagonal(sim_matrix, -2.0)                  # exclude self
+
+    def genus(name):  return tax_db.get(name, {}).get("genus",  "")
+    def family(name): return tax_db.get(name, {}).get("family", "")
+
+    # Pre-count genus/family sizes for normalisation
+    genus_counts:  dict[str, int] = defaultdict(int)
+    family_counts: dict[str, int] = defaultdict(int)
+    for name, _ in combos_list:
+        if genus(name):  genus_counts[genus(name)]   += 1
+        if family(name): family_counts[family(name)] += 1
+
+    n = len(combos_list)
+    results = []
+    for i, (name, vtype) in enumerate(combos_list):
+        ranked = np.argsort(sim_matrix[i])[::-1]
+        row    = {"species": name, "voc_type": vtype,
+                  "genus": genus(name), "family": family(name)}
+        for k in k_vals:
+            top_k = ranked[:k]
+            row[f"genus_hits@{k}"]  = sum(1 for j in top_k
+                                          if genus(combos_list[j][0])  == genus(name)  and genus(name))
+            row[f"family_hits@{k}"] = sum(1 for j in top_k
+                                          if family(combos_list[j][0]) == family(name) and family(name))
+        results.append(row)
+
+    summary: dict = {"n_combos": n}
+    for k in k_vals:
+        genus_recalls, family_recalls = [], []
+        genus_randoms, family_randoms = [], []
+        for i, (name, _) in enumerate(combos_list):
+            g = genus(name); f = family(name)
+            max_g = min(k, max(genus_counts[g]  - 1, 0))
+            max_f = min(k, max(family_counts[f] - 1, 0))
+            if max_g > 0:
+                genus_recalls.append(results[i][f"genus_hits@{k}"]  / max_g)
+                genus_randoms.append((genus_counts[g] - 1) / (n - 1))
+            if max_f > 0:
+                family_recalls.append(results[i][f"family_hits@{k}"] / max_f)
+                family_randoms.append((family_counts[f] - 1) / (n - 1))
+        summary[f"genus_R@{k}"]         = float(np.mean(genus_recalls))  if genus_recalls  else 0.0
+        summary[f"family_R@{k}"]        = float(np.mean(family_recalls)) if family_recalls else 0.0
+        summary[f"random_genus_R@{k}"]  = float(np.mean(genus_randoms))  if genus_randoms  else 0.0
+        summary[f"random_family_R@{k}"] = float(np.mean(family_randoms)) if family_randoms else 0.0
+
+    print(f"  [acoustic_coherence] text-embedding neighbour analysis:")
+    for k in k_vals:
+        print(f"    K={k:2d}  "
+              f"genus_R@K={summary[f'genus_R@{k}']:.3f} (random={summary[f'random_genus_R@{k}']:.3f})  "
+              f"family_R@K={summary[f'family_R@{k}']:.3f} (random={summary[f'random_family_R@{k}']:.3f})")
+    return results, summary
+
+
+def run_cross_species_transfer(audio_matrix, valid_clips, clip_to_combo,
+                                model, processor, tax_db, all_labels,
+                                device, batch_size=64):
+    """
+    Cross-species description transfer evaluation.
+
+    For each (species_A, voc_type) combo, takes A's acoustic description and
+    queries the gallery for species B's audio clips, where B is a different
+    species in the same genus as A.
+
+    Interpretation: if the model learned transferable acoustic features,
+    a description of A's call should retrieve B's call better than random
+    (both A and B share genus-level acoustic similarities).
+
+    Returns:
+        results : list of per-query-pair dicts
+        summary : transfer metrics including random baseline
+    """
+    combo_to_indices: dict[tuple, list[int]] = defaultdict(list)
+    for idx, clip in enumerate(valid_clips):
+        combo = clip_to_combo.get(clip)
+        if combo:
+            combo_to_indices[combo].append(idx)
+
+    # Group combos by genus, keep only those in gallery
+    genus_to_combos: dict[str, list[tuple]] = defaultdict(list)
+    for combo in combo_to_indices:
+        name, vtype = combo
+        g = tax_db.get(name, {}).get("genus", "")
+        if g:
+            genus_to_combos[g].append(combo)
+
+    # Genera with multiple species in gallery
+    multi_genus = {g: cs for g, cs in genus_to_combos.items()
+                   if len({c[0] for c in cs}) >= 2}
+
+    if not multi_genus:
+        print("  [cross_species_transfer] no genera with ≥2 species in gallery — skipping")
+        return [], {}
+
+    # Build transfer pairs: (query_text, target_combo, source_species, genus)
+    transfer_pairs = []
+    for genus_name, genus_combos in multi_genus.items():
+        species_set = {c[0] for c in genus_combos}
+        for name_a, vtype_a in genus_combos:
+            key_a = f"{name_a}||{vtype_a}"
+            rich_a = all_labels.get(key_a, [])[5:]
+            if not rich_a:
+                continue
+            query_text = rich_a[hash(key_a) % len(rich_a)]
+            for name_b in species_set:
+                if name_b == name_a:
+                    continue
+                target = (name_b, vtype_a)
+                if combo_to_indices.get(target):
+                    transfer_pairs.append((query_text, target, name_a, genus_name))
+
+    if not transfer_pairs:
+        print("  [cross_species_transfer] no valid cross-species pairs — skipping")
+        return [], {}
+
+    n_genera_used = len({p[3] for p in transfer_pairs})
+    print(f"  [cross_species_transfer] {len(transfer_pairs)} query pairs "
+          f"across {n_genera_used} genera ...")
+
+    texts = [p[0] for p in transfer_pairs]
+    flat_embs = []
+    for i in range(0, len(texts), batch_size):
+        flat_embs.append(encode_text_batch(texts[i : i + batch_size], processor, model, device))
+    text_matrix = torch.cat(flat_embs, dim=0).numpy()
+    sim_matrix  = text_matrix @ audio_matrix.T
+
+    n_gallery = len(valid_clips)
+    results = []
+    for q_idx, (query_text, target_combo, src_species, genus_name) in enumerate(transfer_pairs):
+        pos_indices = combo_to_indices[target_combo]
+        m = retrieval_metrics(sim_matrix[q_idx], pos_indices)
+        results.append({
+            "source_species":  src_species,
+            "target_species":  target_combo[0],
+            "voc_type":        target_combo[1],
+            "genus":           genus_name,
+            "n_positives":     len(pos_indices),
+            "mAP":             m["mAP"],
+            "MRR":             m["MRR"],
+            "recall_at_k":     m["recall_at_k"],
+            "first_hit_rank":  m["first_hit_rank"],
+        })
+
+    avg_n_pos  = np.mean([r["n_positives"] for r in results])
+    random_r1  = avg_n_pos / n_gallery
+    fhr = [r["first_hit_rank"] for r in results if r["first_hit_rank"] > 0]
+    summary = {
+        "mAP":               float(np.mean([r["mAP"] for r in results])),
+        "MRR":               float(np.mean([r["MRR"] for r in results])),
+        "R@1":               float(np.mean([r["recall_at_k"][1] for r in results])),
+        "R@5":               float(np.mean([r["recall_at_k"][5] for r in results])),
+        "R@10":              float(np.mean([r["recall_at_k"][10] for r in results])),
+        "median_first_rank": float(np.median(fhr)) if fhr else float(n_gallery),
+        "random_R@1":        float(random_r1),
+        "n_queries":         len(results),
+        "n_genera":          n_genera_used,
+    }
+    print(f"  [cross_species_transfer] "
+          f"R@1={summary['R@1']:.3f} (random={summary['random_R@1']:.4f})  "
+          f"R@5={summary['R@5']:.3f}  mAP={summary['mAP']:.3f}  "
+          f"({summary['n_queries']} pairs, {summary['n_genera']} genera)")
+    return results, summary
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Plotting
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -498,65 +825,7 @@ def generate_plots(all_results: dict, tax_db: dict, figures_dir: Path):
     plt.close(fig)
     print(f"  Saved: strategy_comparison.pdf")
 
-    # ── 2. Recall@K curve ─────────────────────────────────────────────────────
-    fig, axes = plt.subplots(1, len(all_results),
-                             figsize=(5.5 * len(all_results), 4), sharey=True, squeeze=False)
-    fig.suptitle("Recall@K Curve (K = 1 … 20)", fontweight="bold")
-    ks = list(range(1, 21))
-
-    for ax, (model_key, res) in zip(axes[0], all_results.items()):
-        for i, s in enumerate(strategies_present):
-            if s not in res["agg"]:
-                continue
-            vals = [res["agg"][s].get(f"R@{k}", np.nan) for k in ks]
-            ax.plot(ks, vals, marker="o", markersize=3, linewidth=1.5,
-                    color=STRATEGY_COLORS[i], label=STRATEGY_LABELS.get(s, s))
-        ax.set_title(model_key)
-        ax.set_xlabel("K")
-        ax.set_ylabel("Recall@K")
-        ax.set_xlim(1, 20)
-        ax.set_ylim(0, 1.05)
-        ax.xaxis.set_major_locator(mticker.MultipleLocator(2))
-        ax.legend(fontsize=8, frameon=False)
-
-    fig.tight_layout()
-    fig.savefig(figures_dir / "recall_at_k.pdf")
-    plt.close(fig)
-    print(f"  Saved: recall_at_k.pdf")
-
-    # ── 3. mAP distribution (violin) ─────────────────────────────────────────
-    for model_key, res in all_results.items():
-        fig, ax = plt.subplots(figsize=(max(6, n_strat * 1.4), 4.5))
-        data  = [np.array([c["mAP"] for c in res["detail"].get(s, [])]) for s in strategies_present]
-        # filter out empty arrays that crash violinplot
-        valid_idx  = [i for i, d in enumerate(data) if len(d) > 0]
-        valid_data = [data[i] for i in valid_idx]
-        valid_pos  = np.arange(n_strat)[valid_idx]
-        parts = ax.violinplot(valid_data, positions=valid_pos, showmedians=True,
-                              showextrema=True)
-        for j, pc in enumerate(parts["bodies"]):
-            pc.set_facecolor(STRATEGY_COLORS[valid_idx[j]])
-            pc.set_alpha(0.7)
-        parts["cmedians"].set_color("black")
-        parts["cmedians"].set_linewidth(1.5)
-
-        # Overlay median value text
-        for i, d in enumerate(data):
-            if len(d):
-                ax.text(i, np.median(d) + 0.02, f"{np.median(d):.2f}",
-                        ha="center", va="bottom", fontsize=8)
-
-        ax.set_xticks(np.arange(n_strat))
-        ax.set_xticklabels(s_labels, rotation=35, ha="right", fontsize=8)
-        ax.set_ylabel("Average Precision (per query)")
-        ax.set_ylim(0, 1.05)
-        ax.set_title(f"Per-query mAP Distribution — {model_key}")
-        fig.tight_layout()
-        fig.savefig(figures_dir / f"map_distribution_{model_key}.pdf")
-        plt.close(fig)
-        print(f"  Saved: map_distribution_{model_key}.pdf")
-
-    # ── 4. Taxonomic class breakdown ──────────────────────────────────────────
+    # ── 2. Taxonomic class breakdown ──────────────────────────────────────────
     for model_key, res in all_results.items():
         # Collect mAP per (class, strategy)
         class_map: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
@@ -592,46 +861,7 @@ def generate_plots(all_results: dict, tax_db: dict, figures_dir: Path):
         plt.close(fig)
         print(f"  Saved: class_breakdown_{model_key}.pdf")
 
-    # ── 5. Similarity score distribution (positive vs negative) ──────────────
-    for model_key, res in all_results.items():
-        fig, axes = plt.subplots(2, 3, figsize=(13, 7), sharey=False)
-        fig.suptitle(f"Positive vs Negative Similarity Distributions — {model_key}",
-                     fontweight="bold")
-        axes_flat = axes.flatten()
-
-        for i, s in enumerate(strategies_present[:6]):
-            ax = axes_flat[i]
-            sims = res.get("sim_data", {}).get(s)
-            if not sims:
-                ax.set_visible(False)
-                continue
-            pos = np.array(sims["pos"])
-            neg = np.array(sims["neg"])
-            # KDE via histogram approximation
-            bins = np.linspace(-0.1, 1.0, 60)
-            ax.hist(neg, bins=bins, density=True, alpha=0.55, color="#d6604d", label="Negative")
-            ax.hist(pos, bins=bins, density=True, alpha=0.75, color="#2166ac", label="Positive")
-            ax.axvline(np.mean(pos), color="#2166ac", linestyle="--", linewidth=1)
-            ax.axvline(np.mean(neg), color="#d6604d", linestyle="--", linewidth=1)
-            ax.set_title(STRATEGY_LABELS.get(s, s), fontsize=9)
-            ax.set_xlabel("Cosine similarity", fontsize=8)
-            ax.set_ylabel("Density", fontsize=8)
-            ax.legend(fontsize=7, frameon=False)
-            # Annotate separation
-            sep = np.mean(pos) - np.mean(neg)
-            ax.text(0.97, 0.95, f"Δμ = {sep:.3f}", transform=ax.transAxes,
-                    ha="right", va="top", fontsize=8,
-                    bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7))
-
-        for j in range(i + 1, len(axes_flat)):
-            axes_flat[j].set_visible(False)
-
-        fig.tight_layout()
-        fig.savefig(figures_dir / f"similarity_distribution_{model_key}.pdf")
-        plt.close(fig)
-        print(f"  Saved: similarity_distribution_{model_key}.pdf")
-
-    # ── 6. Hardest / easiest species (using 'name' strategy) ─────────────────
+    # ── 3. Hardest / easiest species (using 'name' strategy) ─────────────────
     for model_key, res in all_results.items():
         detail = res["detail"].get("name") or res["detail"].get(strategies_present[0], [])
         if not detail:
@@ -665,48 +895,7 @@ def generate_plots(all_results: dict, tax_db: dict, figures_dir: Path):
         plt.close(fig)
         print(f"  Saved: hardest_easiest_{model_key}.pdf")
 
-    # ── 7. Rank distribution ─────────────────────────────────────────────────
-    # Shows where in the gallery the first positive hit lands for each query.
-    # A model that genuinely understands acoustics should cluster ranks near 1.
-    for model_key, res in all_results.items():
-        fig, axes = plt.subplots(1, len(strategies_present),
-                                 figsize=(3.2 * len(strategies_present), 3.8),
-                                 sharey=True)
-        if len(strategies_present) == 1:
-            axes = [axes]
-        fig.suptitle(f"First-Hit Rank Distribution — {model_key}", fontweight="bold")
-
-        n_gallery_est = None
-        for ax, s in zip(axes, strategies_present):
-            ranks = [c["first_hit_rank"] for c in res["detail"].get(s, []) if c["first_hit_rank"] > 0]
-            if not ranks:
-                ax.set_visible(False)
-                continue
-            if n_gallery_est is None:
-                n_gallery_est = max(ranks) + 1  # rough upper bound
-            med = np.median(ranks)
-            mn  = np.mean(ranks)
-            # Use log-spaced bins so near-rank-1 entries are visible
-            bins = np.unique(np.round(
-                np.geomspace(1, max(ranks) + 1, 30)
-            ).astype(int))
-            ax.hist(ranks, bins=bins, color=STRATEGY_COLORS[strategies_present.index(s)],
-                    alpha=0.8, edgecolor="white", linewidth=0.4)
-            ax.axvline(med, color="black", linewidth=1.2, linestyle="--")
-            ax.text(0.97, 0.96, f"med={med:.0f}\nmean={mn:.0f}",
-                    transform=ax.transAxes, ha="right", va="top", fontsize=7.5,
-                    bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.8))
-            ax.set_xscale("log")
-            ax.set_title(STRATEGY_LABELS.get(s, s), fontsize=8)
-            ax.set_xlabel("Rank of first hit (log scale)", fontsize=7)
-            ax.set_ylabel("# queries", fontsize=7)
-
-        fig.tight_layout()
-        fig.savefig(figures_dir / f"rank_distribution_{model_key}.pdf")
-        plt.close(fig)
-        print(f"  Saved: rank_distribution_{model_key}.pdf")
-
-    # ── 8. Rank CDF ──────────────────────────────────────────────────────────
+    # ── 4. Rank CDF ───────────────────────────────────────────────────────────
     # Cumulative fraction of queries where first hit ≤ k — complements R@K curve
     # but on the full rank range so you can see the long tail.
     for model_key, res in all_results.items():
@@ -738,7 +927,7 @@ def generate_plots(all_results: dict, tax_db: dict, figures_dir: Path):
         plt.close(fig)
         print(f"  Saved: rank_cdf_{model_key}.pdf")
 
-    # ── 9. Delta chart (fine-tuned − base) ────────────────────────────────────
+    # ── 5. Delta chart (fine-tuned − base) ────────────────────────────────────
     if "finetuned" in all_results and "base" in all_results:
         metrics = ["mAP", "MRR", "R@1", "R@5", "R@10"]
         n_m     = len(metrics)
@@ -770,6 +959,130 @@ def generate_plots(all_results: dict, tax_db: dict, figures_dir: Path):
         fig.savefig(figures_dir / "delta_finetuned_vs_base.pdf")
         plt.close(fig)
         print(f"  Saved: delta_finetuned_vs_base.pdf")
+
+
+def generate_semantic_plots(semantic_results: dict, figures_dir: Path):
+    """
+    Generate plots for the three semantic search evaluations:
+      10. semantic_probe_results.pdf   — per-query R@K bars
+      11. acoustic_coherence.pdf       — genus/family R@K vs random baseline
+      12. cross_species_transfer.pdf   — transfer R@K by genus, vs random
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as mticker
+
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    plt.rcParams.update({
+        "font.family": "DejaVu Sans", "font.size": 10,
+        "axes.spines.top": False, "axes.spines.right": False,
+        "axes.grid": True, "axes.grid.axis": "y", "grid.alpha": 0.3,
+        "figure.dpi": 150, "savefig.bbox": "tight", "savefig.dpi": 200,
+    })
+
+    for model_key, sem in semantic_results.items():
+        # ── 10. Semantic probe: per-query R@K bar chart ───────────────────────
+        probe_results = sem.get("semantic_probe_results", [])
+        if probe_results:
+            ks     = [1, 5, 10]
+            labels = [r["query"][:45] + "…" if len(r["query"]) > 45 else r["query"]
+                      for r in probe_results]
+            n_q    = len(probe_results)
+            x      = np.arange(n_q)
+            width  = 0.25
+            colors = ["#2166ac", "#5aae61", "#d6604d"]
+
+            fig, ax = plt.subplots(figsize=(max(8, n_q * 1.5 + 2), 4.5))
+            for i, k in enumerate(ks):
+                vals = [r["recall_at_k"][k] for r in probe_results]
+                ax.bar(x + (i - 1) * width, vals, width, label=f"R@{k}",
+                       color=colors[i], alpha=0.85, edgecolor="white")
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels, rotation=35, ha="right", fontsize=8)
+            ax.set_ylim(0, 1.1)
+            ax.set_ylabel("Recall@K")
+            ax.set_title(f"Semantic Probe: Purely-Acoustic Query Results — {model_key}",
+                         fontweight="bold")
+            ax.legend(fontsize=9, frameon=False)
+            fig.tight_layout()
+            fig.savefig(figures_dir / f"semantic_probe_{model_key}.pdf")
+            plt.close(fig)
+            print(f"  Saved: semantic_probe_{model_key}.pdf")
+
+        # ── 11. Acoustic coherence: genus/family R@K vs random ───────────────
+        coh_summary = sem.get("acoustic_coherence_summary", {})
+        if coh_summary and "n_combos" in coh_summary:
+            k_vals = sorted({int(key.split("@")[1]) for key in coh_summary
+                             if key.startswith("genus_R@")})
+            if k_vals:
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4.5), sharey=False)
+                fig.suptitle(f"Acoustic Coherence: Embedding-Space Neighbour Analysis — {model_key}",
+                             fontweight="bold")
+                for ax, level, color, rand_color in [
+                    (ax1, "genus",  "#2166ac", "#abd9e9"),
+                    (ax2, "family", "#5aae61", "#a6d96a"),
+                ]:
+                    model_vals  = [coh_summary.get(f"{level}_R@{k}", 0) for k in k_vals]
+                    random_vals = [coh_summary.get(f"random_{level}_R@{k}", 0) for k in k_vals]
+                    x = np.arange(len(k_vals))
+                    ax.bar(x - 0.2, model_vals,  0.38, label="Model",  color=color,      alpha=0.9)
+                    ax.bar(x + 0.2, random_vals, 0.38, label="Random", color=rand_color, alpha=0.75)
+                    for xi, (mv, rv) in enumerate(zip(model_vals, random_vals)):
+                        ax.text(xi - 0.2, mv + 0.01, f"{mv:.2f}", ha="center", fontsize=8)
+                        ax.text(xi + 0.2, rv + 0.01, f"{rv:.2f}", ha="center", fontsize=8)
+                    ax.set_xticks(x)
+                    ax.set_xticklabels([f"K={k}" for k in k_vals])
+                    ax.set_ylim(0, 1.1)
+                    ax.set_ylabel("R@K (normalised)")
+                    ax.set_title(f"Same-{level} neighbour recall")
+                    ax.legend(fontsize=9, frameon=False)
+                fig.tight_layout()
+                fig.savefig(figures_dir / f"acoustic_coherence_{model_key}.pdf")
+                plt.close(fig)
+                print(f"  Saved: acoustic_coherence_{model_key}.pdf")
+
+        # ── 12. Cross-species transfer: R@K by genus ─────────────────────────
+        xfer_results = sem.get("cross_species_transfer_results", [])
+        xfer_summary = sem.get("cross_species_transfer_summary", {})
+        if xfer_results and xfer_summary:
+            # Aggregate R@K per genus
+            genus_map: dict[str, list] = defaultdict(list)
+            for r in xfer_results:
+                genus_map[r["genus"]].append(r)
+            genera = sorted(genus_map.keys(),
+                            key=lambda g: -np.mean([r["recall_at_k"][1] for r in genus_map[g]]))[:20]
+
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+            fig.suptitle(f"Cross-Species Description Transfer — {model_key}", fontweight="bold")
+
+            # Left: R@1 per genus (top-20 by R@1)
+            r1_per_genus = [np.mean([r["recall_at_k"][1] for r in genus_map[g]]) for g in genera]
+            y = np.arange(len(genera))
+            colors_bar = ["#2166ac" if v > xfer_summary.get("random_R@1", 0) else "#d6604d"
+                          for v in r1_per_genus]
+            ax1.barh(y, r1_per_genus, color=colors_bar, alpha=0.85, edgecolor="white")
+            ax1.axvline(xfer_summary.get("random_R@1", 0), color="gray",
+                        linewidth=1.2, linestyle="--", label="Random baseline")
+            ax1.set_yticks(y); ax1.set_yticklabels(genera, fontsize=8)
+            ax1.set_xlabel("R@1"); ax1.set_title("R@1 per genus (top-20 by R@1)")
+            ax1.invert_yaxis(); ax1.legend(fontsize=8, frameon=False)
+
+            # Right: overall R@K curve vs random baseline
+            ks_xfer = [1, 2, 3, 5, 10]
+            model_rk  = [xfer_summary.get(f"R@{k}", 0) for k in ks_xfer]
+            ax2.plot(ks_xfer, model_rk, "o-", color="#2166ac", linewidth=2, label="Transfer R@K")
+            ax2.axhline(xfer_summary.get("random_R@1", 0), color="gray",
+                        linewidth=1.2, linestyle="--", label="Random baseline (R@1)")
+            ax2.set_xlabel("K"); ax2.set_ylabel("Recall@K")
+            ax2.set_title("Overall transfer R@K vs random")
+            ax2.set_ylim(0, max(max(model_rk) * 1.2, 0.05))
+            ax2.legend(fontsize=9, frameon=False)
+
+            fig.tight_layout()
+            fig.savefig(figures_dir / f"cross_species_transfer_{model_key}.pdf")
+            plt.close(fig)
+            print(f"  Saved: cross_species_transfer_{model_key}.pdf")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -817,6 +1130,17 @@ def main():
     parser.add_argument("--batch-size",     type=int, default=16)
     parser.add_argument("--device",         default=None)
     parser.add_argument("--no-plots",       action="store_true", help="Skip plot generation")
+    # Semantic search evaluations
+    parser.add_argument("--semantic-queries",  default=None, metavar="JSON",
+                        help="Path to hand-written acoustic probe queries JSON "
+                             "(see data/semantic_queries_example.json for format). "
+                             "Queries must NOT contain species names.")
+    parser.add_argument("--acoustic-coherence", action="store_true",
+                        help="Run acoustic coherence eval: measures whether same-genus "
+                             "species cluster together in text-embedding space")
+    parser.add_argument("--cross-species-eval", action="store_true",
+                        help="Run cross-species description transfer: tests if species A's "
+                             "acoustic description retrieves species B's audio (same genus)")
     args = parser.parse_args()
 
     device = args.device or (
@@ -864,24 +1188,74 @@ def main():
         print(f"  {s:<16}: {len(q)} queries")
 
     audio_root  = Path(args.audio_root)
-    all_results = {}   # {model_key: {"agg": ..., "detail": ..., "sim_data": ...}}
+    all_results = {}        # {model_key: {"agg": ..., "detail": ..., "sim_data": ...}}
+    semantic_results = {}   # {model_key: {"semantic_probe_*": ..., ...}}
 
-    def evaluate(checkpoint, label):
+    # Load hand-written acoustic probe queries if provided
+    probe_queries: list = []
+    if args.semantic_queries:
+        sq_path = Path(args.semantic_queries)
+        if sq_path.exists():
+            probe_queries = json.loads(sq_path.read_text(encoding="utf-8"))
+            print(f"Loaded {len(probe_queries)} semantic probe queries from {sq_path}")
+        else:
+            print(f"[warn] --semantic-queries path not found: {sq_path}")
+
+    run_sem_evals = probe_queries or args.acoustic_coherence or args.cross_species_eval
+
+    def evaluate(checkpoint, label, model_key):
         model, processor = load_model(checkpoint, args.model, device)
+
+        # Encode gallery once — reused by all evals for this model
+        audio_matrix, vc = encode_gallery(
+            model, processor, val_clips, audio_root, device, args.batch_size)
+
         agg, detail, sim_data = run_eval(
             model, processor, val_clips, clip_to_combo,
-            strategies, audio_root, device, args.batch_size)
-        del model
+            strategies, audio_root, device, args.batch_size,
+            audio_matrix=audio_matrix, valid_clips_in=vc)
         print_table(label, agg)
+
+        # ── Semantic search evaluations ───────────────────────────────────────
+        sem: dict = {}
+        if probe_queries:
+            print(f"\n  [semantic_probe] evaluating {len(probe_queries)} acoustic queries ...")
+            sp_results, sp_summary = run_semantic_probe(
+                audio_matrix, vc, clip_to_combo,
+                model, processor, probe_queries, device)
+            sem["semantic_probe_results"] = sp_results
+            sem["semantic_probe_summary"] = sp_summary
+
+        if args.acoustic_coherence:
+            print(f"\n  [acoustic_coherence] ...")
+            coh_results, coh_summary = run_acoustic_coherence(
+                model, processor, val_combos, tax_db, all_labels, device)
+            sem["acoustic_coherence_results"] = coh_results
+            sem["acoustic_coherence_summary"] = coh_summary
+
+        if args.cross_species_eval:
+            print(f"\n  [cross_species_transfer] ...")
+            xfer_results, xfer_summary = run_cross_species_transfer(
+                audio_matrix, vc, clip_to_combo,
+                model, processor, tax_db, all_labels, device)
+            sem["cross_species_transfer_results"] = xfer_results
+            sem["cross_species_transfer_summary"] = xfer_summary
+
+        if sem:
+            semantic_results[model_key] = sem
+
+        del model
         return {"agg": agg, "detail": detail, "sim_data": sim_data}
 
     if args.checkpoint:
         print(f"\n{'='*72}\n  Evaluating: fine-tuned  ({args.checkpoint})")
-        all_results["finetuned"] = evaluate(args.checkpoint, f"Fine-tuned: {args.checkpoint}")
+        all_results["finetuned"] = evaluate(
+            args.checkpoint, f"Fine-tuned: {args.checkpoint}", "finetuned")
 
     if args.also_base or not args.checkpoint:
         print(f"\n{'='*72}\n  Evaluating: base model  ({args.model})")
-        all_results["base"] = evaluate(None, f"Base model (zero-shot): {args.model}")
+        all_results["base"] = evaluate(
+            None, f"Base model (zero-shot): {args.model}", "base")
 
     # ── Zero-shot holdout species eval ────────────────────────────────────────
     # Evaluates on species that were NEVER in training — tests whether the model
@@ -945,6 +1319,21 @@ def main():
             "agg":    v["agg"],
             "detail": v["detail"],   # per-combo metrics, no raw sims
         }
+    # Attach semantic eval summaries (exclude large per-item result lists)
+    semantic_save: dict = {}
+    for mk, sem in semantic_results.items():
+        semantic_save[mk] = {
+            key: val for key, val in sem.items() if key.endswith("_summary")
+        }
+        # Include probe per-query results (compact) since there are few queries
+        if "semantic_probe_results" in sem:
+            semantic_save[mk]["semantic_probe_results"] = [
+                {k2: v2 for k2, v2 in r.items() if k2 != "recall_at_k"}
+                | {"R@1": r["recall_at_k"].get(1), "R@5": r["recall_at_k"].get(5),
+                   "R@10": r["recall_at_k"].get(10)}
+                for r in sem["semantic_probe_results"]
+            ]
+
     out_path.write_text(
         json.dumps(
             {
@@ -953,6 +1342,7 @@ def main():
                 "n_val_clips": len(val_clips),
                 "n_val_combos": len(val_combos),
                 "results": save_data,
+                "semantic_eval": semantic_save,
             },
             indent=2,
             ensure_ascii=False,
@@ -964,8 +1354,12 @@ def main():
 
     # Generate plots
     if not args.no_plots:
-        print(f"\nGenerating plots -> {args.figures_dir}/")
-        generate_plots(all_results, tax_db, Path(args.figures_dir))
+        figs = Path(args.figures_dir)
+        print(f"\nGenerating plots -> {figs}/")
+        generate_plots(all_results, tax_db, figs)
+        if semantic_results:
+            print(f"\nGenerating semantic eval plots ...")
+            generate_semantic_plots(semantic_results, figs)
         print(f"All plots saved.")
 
 
