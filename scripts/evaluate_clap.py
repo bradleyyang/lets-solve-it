@@ -40,6 +40,12 @@ Usage:
     python scripts/evaluate_clap.py --checkpoint checkpoints/best.pt
     python scripts/evaluate_clap.py --checkpoint checkpoints/best.pt --also-base
     python scripts/evaluate_clap.py          # base model only
+
+    Full eval with semantic probes + audio-space coherence + unseen-species (holdout):
+      python scripts/build_semantic_queries.py
+      python scripts/evaluate_clap.py --checkpoint checkpoints/sixth-fine-tune/best.pt \\
+          --semantic-queries data/semantic_queries.json \\
+          --acoustic-coherence --cross-species-eval --also-base
 """
 
 import argparse
@@ -68,7 +74,7 @@ AUDIO_SR              = 48_000
 CLIP_SECONDS          = 10
 MIN_DURATION_S        = 0.5  # match scripts/train_clap.py
 STRATEGY_ORDER        = ["name", "scientific", "chain", "sci_common", "chain_common",
-                         "rich", "rich_holdout", "all_variants"]
+                         "rich", "rich_holdout", "semantic", "all_variants"]
 STRATEGY_LABELS       = {
     "name":         "Common name",
     "scientific":   "Scientific name",
@@ -77,6 +83,7 @@ STRATEGY_LABELS       = {
     "chain_common": "Chain + common",
     "rich":         "Rich description",
     "rich_holdout": "Rich (held-out)",
+    "semantic":     "Semantic probe",
     "all_variants": "Ensemble (all)",
 }
 
@@ -283,6 +290,91 @@ def build_queries(combos, tax_db, all_labels, holdout_descs=None):
     return strategies
 
 
+def merge_semantic_queries(
+    strategies: dict,
+    semantic_path: Path,
+    combos: list[tuple[str, str]],
+) -> None:
+    """
+    Add strategy \"semantic\" from data/semantic_queries.json (keys: name||vtype).
+    Built by scripts/build_semantic_queries.py.
+    """
+    data = json.loads(semantic_path.read_text(encoding="utf-8"))
+    strategies["semantic"] = {}
+    for combo in combos:
+        key = f"{combo[0]}||{combo[1]}"
+        texts = data.get(key)
+        if not texts:
+            continue
+        if isinstance(texts, str):
+            texts = [texts]
+        strategies["semantic"][combo] = [t.strip() for t in texts if t and str(t).strip()]
+
+
+def compute_acoustic_coherence_metrics(
+    audio_matrix: np.ndarray,
+    valid_clips: list[str],
+    clip_to_combo: dict,
+) -> dict:
+    """
+    Measures how clustered same-(species,type) audio embeddings are vs random pairs.
+    Uses cosine similarity (rows of audio_matrix are L2-normalised).
+    """
+    import itertools
+
+    n = len(valid_clips)
+    idx_to_combo: list[tuple[str, str] | None] = []
+    for clip in valid_clips:
+        idx_to_combo.append(clip_to_combo.get(clip))
+
+    combo_to_indices: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for i, c in enumerate(idx_to_combo):
+        if c is not None:
+            combo_to_indices[c].append(i)
+
+    intra_sims: list[float] = []
+    for idxs in combo_to_indices.values():
+        if len(idxs) < 2:
+            continue
+        for i, j in itertools.combinations(idxs, 2):
+            intra_sims.append(float(np.dot(audio_matrix[i], audio_matrix[j])))
+    mean_intra = float(np.mean(intra_sims)) if intra_sims else float("nan")
+
+    rng = np.random.default_rng(42)
+    inter_sims: list[float] = []
+    max_samples = min(8000, max(1, n * (n - 1)))
+    tries = 0
+    while len(inter_sims) < max_samples and tries < max_samples * 3:
+        tries += 1
+        i, j = int(rng.integers(0, n)), int(rng.integers(0, n))
+        if i == j:
+            continue
+        ci, cj = idx_to_combo[i], idx_to_combo[j]
+        if ci is None or cj is None or ci == cj:
+            continue
+        inter_sims.append(float(np.dot(audio_matrix[i], audio_matrix[j])))
+    mean_inter = float(np.mean(inter_sims)) if inter_sims else float("nan")
+
+    separation = (
+        mean_intra - mean_inter
+        if np.isfinite(mean_intra) and np.isfinite(mean_inter)
+        else float("nan")
+    )
+    ratio = (
+        mean_intra / (mean_inter + 1e-8)
+        if np.isfinite(mean_inter)
+        else float("nan")
+    )
+    return {
+        "mean_intra_combo_similarity": mean_intra,
+        "mean_inter_combo_similarity": mean_inter,
+        "separation": separation,
+        "intra_over_inter_ratio": ratio,
+        "n_intra_pairs": len(intra_sims),
+        "n_inter_pairs_sampled": len(inter_sims),
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Model loader
 # ─────────────────────────────────────────────────────────────────────────────
@@ -319,12 +411,14 @@ def load_model(checkpoint, base_model, device):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_eval(model, processor, val_clips, clip_to_combo,
-             strategies, audio_root, device, batch_size=16):
+             strategies, audio_root, device, batch_size=16,
+             compute_acoustic_coherence: bool = False):
     """
     Returns:
         agg     : {strategy: {metric: float}}   — macro-averaged metrics
         detail  : {strategy: [{combo, mAP, MRR, R@k, tax_class, ...}]}
         sim_data: {strategy: {"pos": [...], "neg": [...]}}
+        extras  : e.g. {\"acoustic_coherence\": {...}} when requested
     """
     # Encode audio
     print(f"\n  Encoding {len(val_clips)} val audio clips ...")
@@ -354,6 +448,18 @@ def run_eval(model, processor, val_clips, clip_to_combo,
         combo = clip_to_combo.get(clip)
         if combo:
             combo_to_indices[combo].append(idx)
+
+    extras: dict = {}
+    if compute_acoustic_coherence:
+        extras["acoustic_coherence"] = compute_acoustic_coherence_metrics(
+            audio_matrix, valid_clips, clip_to_combo
+        )
+        ac = extras["acoustic_coherence"]
+        print(
+            f"\n  Acoustic coherence: intra={ac['mean_intra_combo_similarity']:.4f}  "
+            f"inter={ac['mean_inter_combo_similarity']:.4f}  "
+            f"separation={ac['separation']:.4f}  (ratio={ac['intra_over_inter_ratio']:.3f})"
+        )
 
     agg, detail, sim_data = {}, {}, {}
 
@@ -427,7 +533,7 @@ def run_eval(model, processor, val_clips, clip_to_combo,
               f"median_rank={a['median_first_rank']:.0f}/{n_gallery}  "
               f"({a['n_queries']} queries)")
 
-    return agg, detail, sim_data
+    return agg, detail, sim_data, extras
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -817,6 +923,18 @@ def main():
     parser.add_argument("--batch-size",     type=int, default=16)
     parser.add_argument("--device",         default=None)
     parser.add_argument("--no-plots",       action="store_true", help="Skip plot generation")
+    parser.add_argument(
+        "--semantic-queries", default=None, metavar="PATH",
+        help='JSON from scripts/build_semantic_queries.py; adds "semantic" query strategy',
+    )
+    parser.add_argument(
+        "--acoustic-coherence", action="store_true",
+        help="Report intra- vs inter-combo cosine similarity of audio embeddings",
+    )
+    parser.add_argument(
+        "--cross-species-eval", action="store_true",
+        help="Require holdout pairs file and run zero-shot unseen-species retrieval",
+    )
     args = parser.parse_args()
 
     device = args.device or (
@@ -839,17 +957,40 @@ def main():
     else:
         print(f"[info] No held-out descriptions at {holdout_desc_path} — rich_holdout strategy skipped")
 
-    df       = pd.read_csv(args.metadata, encoding="utf-8")
-    name_col = next((c for c in ("common_name", "species", "name") if c in df.columns), None)
-    type_col = next((c for c in ("vocalization_type", "type") if c in df.columns), None)
-    path_col = next((c for c in ("filepath", "file_path", "path", "filename") if c in df.columns), None)
-    clip_to_combo = {
-        str(row[path_col]).strip(): (
-            str(row[name_col]).strip(),
-            str(row[type_col]).split(",")[0].strip().lower()
-        )
-        for _, row in df.iterrows()
-    }
+    def _combo_from_pair_field(raw: str) -> tuple[str, str] | None:
+        if not raw or "||" not in raw:
+            return None
+        name, vtype = raw.split("||", 1)
+        name = name.strip()
+        vtype = vtype.strip().lower()
+        return (name, vtype) if name and vtype else None
+
+    metadata_path = Path(args.metadata)
+    if metadata_path.is_file():
+        df       = pd.read_csv(metadata_path, encoding="utf-8")
+        name_col = next((c for c in ("common_name", "species", "name") if c in df.columns), None)
+        type_col = next((c for c in ("vocalization_type", "type") if c in df.columns), None)
+        path_col = next((c for c in ("filepath", "file_path", "path", "filename") if c in df.columns), None)
+        clip_to_combo = {
+            str(row[path_col]).strip(): (
+                str(row[name_col]).strip(),
+                str(row[type_col]).split(",")[0].strip().lower()
+            )
+            for _, row in df.iterrows()
+        }
+    else:
+        print(f"[info] No metadata CSV at {metadata_path} — using \"combo\" fields from pair JSONs")
+        clip_to_combo = {}
+        for p in val_pairs:
+            c = _combo_from_pair_field(p.get("combo", ""))
+            if c:
+                clip_to_combo[p["audio"]] = c
+        ho_meta = Path(args.holdout_pairs)
+        if ho_meta.is_file():
+            for p in json.loads(ho_meta.read_text(encoding="utf-8")):
+                c = _combo_from_pair_field(p.get("combo", ""))
+                if c:
+                    clip_to_combo[p["audio"]] = c
 
     seen, val_clips = set(), []
     for p in val_pairs:
@@ -859,7 +1000,19 @@ def main():
     val_combos = list({clip_to_combo[c] for c in val_clips if c in clip_to_combo})
     print(f"Val clips: {len(val_clips)}  |  (species, type) combos: {len(val_combos)}")
 
+    if args.cross_species_eval:
+        ho = Path(args.holdout_pairs)
+        if not ho.is_file():
+            raise SystemExit(
+                f"--cross-species-eval requires holdout pairs at {ho}"
+            )
+
     strategies = build_queries(val_combos, tax_db, all_labels, holdout_descs)
+    if args.semantic_queries:
+        sq_path = Path(args.semantic_queries)
+        if not sq_path.is_file():
+            raise SystemExit(f"--semantic-queries file not found: {sq_path}")
+        merge_semantic_queries(strategies, sq_path, val_combos)
     for s, q in strategies.items():
         print(f"  {s:<16}: {len(q)} queries")
 
@@ -868,12 +1021,14 @@ def main():
 
     def evaluate(checkpoint, label):
         model, processor = load_model(checkpoint, args.model, device)
-        agg, detail, sim_data = run_eval(
+        agg, detail, sim_data, extras = run_eval(
             model, processor, val_clips, clip_to_combo,
-            strategies, audio_root, device, args.batch_size)
+            strategies, audio_root, device, args.batch_size,
+            compute_acoustic_coherence=args.acoustic_coherence,
+        )
         del model
         print_table(label, agg)
-        return {"agg": agg, "detail": detail, "sim_data": sim_data}
+        return {"agg": agg, "detail": detail, "sim_data": sim_data, "extras": extras}
 
     if args.checkpoint:
         print(f"\n{'='*72}\n  Evaluating: fine-tuned  ({args.checkpoint})")
@@ -905,12 +1060,14 @@ def main():
 
         def evaluate_holdout(checkpoint, label):
             model, processor = load_model(checkpoint, args.model, device)
-            agg, detail, _ = run_eval(
+            agg, detail, _, extras = run_eval(
                 model, processor, holdout_clips_list, clip_to_combo,
-                holdout_strats, audio_root, device, args.batch_size)
+                holdout_strats, audio_root, device, args.batch_size,
+                compute_acoustic_coherence=args.acoustic_coherence,
+            )
             del model
             print_table(f"{label} [ZERO-SHOT unseen species]", agg)
-            return {"agg": agg, "detail": detail}
+            return {"agg": agg, "detail": detail, "extras": extras}
 
         if args.checkpoint:
             all_results["finetuned_zeroshot"] = evaluate_holdout(
@@ -945,6 +1102,8 @@ def main():
             "agg":    v["agg"],
             "detail": v["detail"],   # per-combo metrics, no raw sims
         }
+        if v.get("extras"):
+            save_data[k]["extras"] = v["extras"]
     out_path.write_text(
         json.dumps(
             {

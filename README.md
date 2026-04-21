@@ -36,6 +36,12 @@ pip install -r requirements-ml.txt
 python scripts/mini_clap_xc_sample.py --sample 6
 ```
 
+### Web dashboard (mock UI)
+
+Requires [Node.js](https://nodejs.org/) (LTS), which provides `npm`. From the repo root: `cd web`, then `npm install` and `npm run dev` to start the Vite dev server. Search and classification use mocked data until a backend is wired in.
+
+If `npm` is not recognized in the terminal, Node is missing or not on your PATH—see **[web/README.md](web/README.md)** (install Node, restart the terminal, verify `node -v` / `npm -v`).
+
 ---
 
 ## CLAP Labelling Pipeline
