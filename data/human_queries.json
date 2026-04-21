@@ -1,0 +1,122 @@
+[
+  {
+    "query": "sounds like it's asking who cooks for you",
+    "positive_combos": ["Barred Owl||song"],
+    "_note": "iconic mnemonic for Barred Owl"
+  },
+  {
+    "query": "owl hooting in the forest at night, deep rhythmic hooting about 8 notes",
+    "positive_combos": ["Barred Owl||song"],
+    "_note": "plain description, no mnemonic"
+  },
+  {
+    "query": "sounds like drink your teeeea with a long trill at the end",
+    "positive_combos": ["Eastern Towhee||song"],
+    "_note": "iconic mnemonic"
+  },
+  {
+    "query": "sharp metallic first note then a musical trill, about one second long",
+    "positive_combos": ["Eastern Towhee||song"],
+    "_note": "acoustic description without mnemonic"
+  },
+  {
+    "query": "teacher teacher teacher getting louder with every repetition",
+    "positive_combos": ["Ovenbird||song"],
+    "_note": "classic ovenbird mnemonic"
+  },
+  {
+    "query": "loud chanting phrase repeated over and over building in volume",
+    "positive_combos": ["Ovenbird||song"],
+    "_note": "plain description"
+  },
+  {
+    "query": "sounds like oh sweet canada canada",
+    "positive_combos": ["White-throated Sparrow||song"],
+    "_note": "classic mnemonic"
+  },
+  {
+    "query": "slow thin pure whistle that sounds a little sad or questioning",
+    "positive_combos": ["White-throated Sparrow||song"],
+    "_note": "plain description"
+  },
+  {
+    "query": "two note whistle fee-bee second note lower, simple and clear",
+    "positive_combos": ["Black-capped Chickadee||song"],
+    "_note": "onomatopoeia"
+  },
+  {
+    "query": "short pure whistled song going slightly downward in pitch",
+    "positive_combos": ["Black-capped Chickadee||song"],
+    "_note": "plain description"
+  },
+  {
+    "query": "haunting wail echoing across a lake, long and eerie",
+    "positive_combos": ["Common Loon||wail"],
+    "_note": "plain description"
+  },
+  {
+    "query": "melancholy quavering cry that carries a long distance over water",
+    "positive_combos": ["Common Loon||wail"],
+    "_note": "evocative plain description"
+  },
+  {
+    "query": "soft slow mournful cooing, sounds sad",
+    "positive_combos": ["Mourning Dove||song"],
+    "_note": "everyday description"
+  },
+  {
+    "query": "gentle coo with a slight rise then fall in pitch, repeated slowly",
+    "positive_combos": ["Mourning Dove||song"],
+    "_note": "slightly more acoustic"
+  },
+  {
+    "query": "beautiful fluty song in the forest, sounds like a flute",
+    "positive_combos": ["Wood Thrush||song"],
+    "_note": "common description of wood thrush"
+  },
+  {
+    "query": "rich melodic warbling with clear ringing notes and airy trills mixed together",
+    "positive_combos": ["Wood Thrush||song"],
+    "_note": "more descriptive"
+  },
+  {
+    "query": "loud shrill kill-deer kill-deer repeated over and over",
+    "positive_combos": ["Killdeer||call"],
+    "_note": "onomatopoeia, species names-like but it's just how it sounds"
+  },
+  {
+    "query": "high pitched piercing two syllable cry repeated urgently",
+    "positive_combos": ["Killdeer||call"],
+    "_note": "plain description"
+  },
+  {
+    "query": "very loud slow powerful hammering on a tree, deep and heavy",
+    "positive_combos": ["Pileated Woodpecker||drumming"],
+    "_note": "plain description"
+  },
+  {
+    "query": "deep slow knocking that echoes through the forest, like someone banging a drum",
+    "positive_combos": ["Pileated Woodpecker||drumming"],
+    "_note": "everyday comparison"
+  },
+  {
+    "query": "conk-la-ree song with a sharp note sliding into a gurgling trill",
+    "positive_combos": ["Red-winged Blackbird||song"],
+    "_note": "onomatopoeia + acoustic"
+  },
+  {
+    "query": "liquid gurgling trill that starts with a sharp click, heard in marshes",
+    "positive_combos": ["Red-winged Blackbird||song"],
+    "_note": "plain description"
+  },
+  {
+    "query": "loud clear whistles that speed up and end with a short trill",
+    "positive_combos": ["Northern Cardinal||song"],
+    "_note": "plain acoustic description"
+  },
+  {
+    "query": "series of pure bright whistles slurring downward then ending quickly",
+    "positive_combos": ["Northern Cardinal||song"],
+    "_note": "more acoustic"
+  }
+]
