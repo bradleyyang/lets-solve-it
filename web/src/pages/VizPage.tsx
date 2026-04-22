@@ -19,10 +19,11 @@ export function VizPage() {
         <Link to="/query">← Back to query</Link>
       </p>
       <header className="page-header">
-        <h1>3D sound stream</h1>
+        <h1>Temporal embedding view</h1>
         <p className="muted">
-          Frame-level audio analysis sampled at 60 fps. Each emitted point carries amplitude + dominant frequency and
-          evolves in a generative 3D network over its lifetime.
+          Frame-wise descriptors (≈60&nbsp;Hz) projected into a fixed 3-D layout. Chirp-aligned
+          sequences are highlighted for qualitative review; no model weights are shipped in this
+          prototype.
         </p>
       </header>
 

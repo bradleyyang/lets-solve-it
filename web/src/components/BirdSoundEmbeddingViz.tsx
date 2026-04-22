@@ -1,8 +1,16 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
+import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
 import { CSS2DObject, CSS2DRenderer } from "three/examples/jsm/renderers/CSS2DRenderer.js";
-import { buildAudioDrivenPoints, extractChirpChains, freqToColor } from "@/lib/audioDrivenPointCloud";
+import {
+  buildAudioDrivenPoints,
+  enrichChirpRgb,
+  extractChirpChains,
+  freqToColor,
+} from "@/lib/audioDrivenPointCloud";
 
 interface BirdSoundEmbeddingVizProps {
   /** Drives deterministic fallback when no real audio file is available. */
@@ -44,6 +52,8 @@ export function BirdSoundEmbeddingViz({ seed, audioFile }: BirdSoundEmbeddingViz
     let pointsMaterial: THREE.PointsMaterial | null = null;
     let lineGeometry: THREE.BufferGeometry | null = null;
     let lineMaterial: THREE.LineBasicMaterial | null = null;
+    let composer: EffectComposer | null = null;
+    let bloomPass: UnrealBloomPass | null = null;
     let labelEls: HTMLDivElement[] = [];
     let labels: CSS2DObject[] = [];
 
@@ -60,6 +70,9 @@ export function BirdSoundEmbeddingViz({ seed, audioFile }: BirdSoundEmbeddingViz
 
       renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 0.92;
 
       labelRenderer = new CSS2DRenderer();
       labelRenderer.domElement.className = "embedding-viz__labels";
@@ -183,13 +196,30 @@ export function BirdSoundEmbeddingViz({ seed, audioFile }: BirdSoundEmbeddingViz
 
       scene.add(new THREE.AmbientLight(0xffffff, 0.32));
 
-      const setSize = () => {
-        if (!renderer || !labelRenderer) return;
+      const dpr = () => Math.min(window.devicePixelRatio, 2);
+      const bloomResolution = () => {
         const w = Math.max(320, mount.clientWidth);
         const h = Math.max(420, mount.clientHeight);
+        const p = dpr();
+        return new THREE.Vector2(Math.max(256, Math.floor(w * p)), Math.max(256, Math.floor(h * p)));
+      };
+      composer = new EffectComposer(renderer);
+      const renderScene = new RenderPass(scene, camera);
+      bloomPass = new UnrealBloomPass(bloomResolution(), 1.02, 0.74, 0.048);
+      composer.addPass(renderScene);
+      composer.addPass(bloomPass);
+
+      const setSize = () => {
+        if (!renderer || !labelRenderer || !composer) return;
+        const w = Math.max(320, mount.clientWidth);
+        const h = Math.max(420, mount.clientHeight);
+        const p = dpr();
         camera.aspect = w / h;
         camera.updateProjectionMatrix();
+        renderer.setPixelRatio(p);
         renderer.setSize(w, h);
+        composer.setPixelRatio(p);
+        composer.setSize(w, h);
         labelRenderer.setSize(w, h);
       };
       setSize();
@@ -214,7 +244,16 @@ export function BirdSoundEmbeddingViz({ seed, audioFile }: BirdSoundEmbeddingViz
       };
 
       const animate = () => {
-        if (!alive || !renderer || !labelRenderer || !controls || !pointsGeometry || !lineGeometry || !lineMaterial)
+        if (
+          !alive ||
+          !renderer ||
+          !labelRenderer ||
+          !composer ||
+          !controls ||
+          !pointsGeometry ||
+          !lineGeometry ||
+          !lineMaterial
+        )
           return;
         raf = requestAnimationFrame(animate);
         const now = performance.now();
@@ -286,17 +325,14 @@ export function BirdSoundEmbeddingViz({ seed, audioFile }: BirdSoundEmbeddingViz
             posAttr.setXYZ(i, bx, by, bz);
           }
 
-          const c = freqToColor(freqs[i]!);
+          const c = enrichChirpRgb(freqToColor(freqs[i]!));
           const amp = amplitudes[i]!;
           const isLit = litSet.has(i);
           if (isLit) {
-            const bright = 1.28 + amp * 1.55;
-            const vividR = Math.min(1.35, c.r * 1.35 + 0.07);
-            const vividG = Math.min(1.35, c.g * 1.32 + 0.06);
-            const vividB = Math.min(1.35, c.b * 1.38 + 0.08);
-            const activeR = vividR * bright;
-            const activeG = vividG * bright;
-            const activeB = vividB * bright;
+            const bright = 1.45 + amp * 1.85;
+            const activeR = c.r * bright;
+            const activeG = c.g * bright;
+            const activeB = c.b * bright;
             const mix = Math.max(0, Math.min(1, masterFade));
             colorAttr.setXYZ(
               i,
@@ -331,9 +367,9 @@ export function BirdSoundEmbeddingViz({ seed, audioFile }: BirdSoundEmbeddingViz
             posAttr.array[ob + 1] as number,
             posAttr.array[ob + 2] as number
           );
-          const cA = freqToColor(freqs[ia]!);
-          const cB = freqToColor(freqs[ib]!);
-          const e = masterFade * 1.18;
+          const cA = enrichChirpRgb(freqToColor(freqs[ia]!));
+          const cB = enrichChirpRgb(freqToColor(freqs[ib]!));
+          const e = masterFade * 1.55;
           lineColorAttr.setXYZ(v0, cA.r * e, cA.g * e, cA.b * e);
           lineColorAttr.setXYZ(v1, cB.r * e, cB.g * e, cB.b * e);
         }
@@ -373,7 +409,7 @@ export function BirdSoundEmbeddingViz({ seed, audioFile }: BirdSoundEmbeddingViz
         }
 
         controls.update();
-        renderer.render(scene, camera);
+        composer.render();
         labelRenderer.render(scene, camera);
       };
       animate();
@@ -391,6 +427,8 @@ export function BirdSoundEmbeddingViz({ seed, audioFile }: BirdSoundEmbeddingViz
       cancelAnimationFrame(raf);
       resizeObserver?.disconnect();
       controls?.dispose();
+      bloomPass?.dispose();
+      composer?.dispose();
       pointsGeometry?.dispose();
       pointsMaterial?.dispose();
       lineGeometry?.dispose();

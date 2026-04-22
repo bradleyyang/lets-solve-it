@@ -160,14 +160,15 @@ export async function buildAudioDrivenPoints(
 export function freqToColor(freqHz: number): { r: number; g: number; b: number } {
   const t = Math.max(0, Math.min(1, (freqHz - MIN_FREQ_HZ) / (MAX_FREQ_HZ - MIN_FREQ_HZ)));
   type ColorStop = [number, [number, number, number]];
+  /** Deep jewel ramp (avoid pastel yellow / pale cyan) so additive chirps read saturated, not “washed.” */
   const stops = [
-    [0.00, [58, 78, 255]],
-    [0.18, [186, 56, 255]],
-    [0.36, [255, 48, 122]],
-    [0.56, [255, 118, 46]],
-    [0.72, [255, 234, 64]],
-    [0.86, [114, 255, 92]],
-    [1.00, [170, 255, 255]],
+    [0.0, [22, 28, 118]],
+    [0.18, [92, 14, 138]],
+    [0.36, [168, 18, 88]],
+    [0.56, [178, 52, 12]],
+    [0.72, [142, 96, 14]],
+    [0.86, [14, 112, 52]],
+    [1.0, [12, 108, 124]],
   ] as ColorStop[];
 
   let a: ColorStop = stops[0]!;
@@ -184,6 +185,25 @@ export function freqToColor(freqHz: number): { r: number; g: number; b: number }
   const local = (t - a[0]) / Math.max(1e-6, b[0] - a[0]);
   const c = [0, 1, 2].map((k) => Math.round(a[1][k]! + (b[1][k]! - a[1][k]!) * local));
   return { r: c[0]! / 255, g: c[1]! / 255, b: c[2]! / 255 };
+}
+
+/**
+ * Push RGB away from grey for richer hues under additive blending (chirp highlights).
+ */
+export function enrichChirpRgb(c: { r: number; g: number; b: number }): { r: number; g: number; b: number } {
+  const w = (c.r + c.g + c.b) / 3;
+  const k = 1.62;
+  let r = w + (c.r - w) * k;
+  let g = w + (c.g - w) * k;
+  let b = w + (c.b - w) * k;
+  const minV = Math.min(r, g, b);
+  if (minV < 0.012) {
+    const lift = 0.012 - minV;
+    r += lift;
+    g += lift;
+    b += lift;
+  }
+  return { r, g, b };
 }
 
 /**
