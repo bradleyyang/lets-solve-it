@@ -501,3 +501,203 @@ a:hover {
   color: var(--muted);
   font-size: 0.9rem;
 }
+
+/* 3D visualization stack: stage (clipped) + species card below (no overlap) */
+.viz-sound-stack {
+  margin-top: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+.viz-sound-panel {
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  box-shadow: var(--shadow-md);
+}
+
+.viz-sound-panel--stage {
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.embedding-viz-topline {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  align-items: center;
+  padding: 0.55rem 0.9rem;
+  background: #080a0d;
+  color: rgba(230, 238, 255, 0.9);
+  border-bottom: 1px solid rgba(130, 156, 206, 0.22);
+  font-size: 0.8rem;
+  font-family: ui-monospace, "Cascadia Code", monospace;
+}
+
+.embedding-viz-stats {
+  color: rgba(208, 220, 255, 0.95);
+}
+
+.embedding-viz-source {
+  color: rgba(146, 172, 214, 0.92);
+}
+
+.embedding-viz {
+  position: relative;
+  width: 100%;
+  min-height: min(68vh, 620px);
+  height: min(68vh, 620px);
+  overflow: hidden;
+}
+
+.embedding-viz--loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #0a0c10;
+  font-size: 0.95rem;
+}
+
+.embedding-viz canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.embedding-viz__labels {
+  overflow: hidden;
+  inset: 0;
+}
+
+.embedding-viz__label {
+  --label-glow: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: 0;
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  pointer-events: none;
+  transition: opacity 0.12s linear;
+  box-sizing: border-box;
+  transform-origin: left center;
+  will-change: transform, opacity, text-shadow;
+  color: rgba(214, 225, 244, 0.82);
+  text-shadow:
+    0 0 calc(5px * var(--label-glow)) rgba(170, 205, 240, 0.36),
+    0 0 calc(11px * var(--label-glow)) rgba(110, 165, 235, 0.22);
+}
+
+.embedding-viz__label.embedding-viz__label--young {
+  text-shadow:
+    0 0 calc(7px * var(--label-glow)) rgba(190, 230, 255, 0.48),
+    0 0 calc(14px * var(--label-glow)) rgba(120, 182, 248, 0.3);
+}
+
+.embedding-viz__label__amp {
+  font-size: 6px;
+  font-weight: 700;
+  line-height: 1.05;
+  letter-spacing: 0.01em;
+}
+
+.embedding-viz__label__t {
+  font-size: 5px;
+  font-weight: 500;
+  line-height: 1.05;
+  opacity: 0.64;
+  color: rgba(189, 202, 228, 0.86);
+}
+
+.viz-sound-species-card {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.9rem 1.1rem;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+
+.viz-sound-species-card__thumb {
+  flex-shrink: 0;
+  width: 80px;
+  height: 80px;
+  border-radius: 10px;
+  object-fit: cover;
+  box-shadow: var(--shadow-sm);
+  border: 1px solid var(--border);
+}
+
+.viz-sound-species-card__meta {
+  min-width: 0;
+}
+
+.viz-sound-species-card__title {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 1.1rem;
+  letter-spacing: -0.02em;
+}
+
+.viz-sound-species-card__sci {
+  font-style: italic;
+  font-size: 0.9rem;
+  margin-top: 0.15rem;
+}
+
+.viz-sound-species-card__rec {
+  margin-top: 0.35rem;
+}
+
+.viz-page__hint {
+  margin-top: 0.75rem;
+}
+
+.viz-data-guide {
+  margin-top: 0.95rem;
+  padding: 0.95rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.viz-data-guide h2 {
+  margin: 0 0 0.75rem;
+  font-family: var(--font-display);
+  font-size: 1.1rem;
+  letter-spacing: -0.02em;
+}
+
+.viz-data-guide__bar {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.5rem 0.6rem;
+  border-radius: 8px;
+  border: 1px solid rgba(42, 111, 168, 0.25);
+  background:
+    linear-gradient(
+      90deg,
+      #3a58ee 0%,
+      #d746f5 22%,
+      #f54949 42%,
+      #f6d53c 62%,
+      #59e45b 80%,
+      #96eeff 100%
+    );
+}
+
+.viz-data-guide__bar span {
+  display: inline-block;
+  text-align: center;
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  font-size: 0.69rem;
+  color: rgba(255, 255, 255, 0.96);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+}
