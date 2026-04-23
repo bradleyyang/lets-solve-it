@@ -174,6 +174,7 @@ class ClapPairDataset(Dataset):
         verbose: bool = True,
         augment: bool = False,
         labels_path: Path | None = None,
+        acoustic_only: bool = False,
     ) -> None:
         raw: list[dict[str, str]] = json.loads(
             pairs_path.read_text(encoding="utf-8")
@@ -183,6 +184,7 @@ class ClapPairDataset(Dataset):
         self.clip_s  = clip_s
         self.root    = audio_root
         self.augment = augment
+        self.acoustic_only = acoustic_only
         # Full label pool per combo for text augmentation (random pick each step)
         self.labels: dict[str, list[str]] = (
             json.loads(labels_path.read_text(encoding="utf-8"))
@@ -220,12 +222,18 @@ class ClapPairDataset(Dataset):
             # Gaussian noise: simulate low-SNR field recordings
             audio = audio + np.random.randn(len(audio)).astype(np.float32) * 0.002
 
-        # Text augmentation: randomly pick any label variant for this combo.
-        # Exposes the model to all 8 templates during training rather than one fixed text.
+        # Text augmentation: randomly pick a label variant for this combo.
         combo = pair.get("combo", "")
         text  = pair["text"]
-        if self.augment and combo and combo in self.labels:
-            text = random.choice(self.labels[combo])
+        if combo and combo in self.labels:
+            pool = self.labels[combo]
+            if self.acoustic_only:
+                # Only rich acoustic descriptions (indices 5+), no taxonomy/name text
+                pool = pool[5:] if len(pool) > 5 else pool
+            if self.augment and pool:
+                text = random.choice(pool)
+            elif self.acoustic_only and pool:
+                text = random.choice(pool)
 
         return {
             "audio":      audio,
@@ -282,12 +290,14 @@ class ClapPrecomputedDataset(Dataset):
         verbose: bool = True,
         augment: bool = False,
         labels_path: Path | None = None,
+        acoustic_only: bool = False,
     ) -> None:
         raw: list[dict[str, str]] = json.loads(
             pairs_path.read_text(encoding="utf-8")
         )
         self.root    = audio_root
         self.augment = augment
+        self.acoustic_only = acoustic_only
         self.labels: dict[str, list[str]] = (
             json.loads(labels_path.read_text(encoding="utf-8"))
             if labels_path and labels_path.exists() else {}
@@ -322,8 +332,14 @@ class ClapPrecomputedDataset(Dataset):
 
         combo = pair.get("combo", "")
         text  = pair["text"]
-        if self.augment and combo and combo in self.labels:
-            text = random.choice(self.labels[combo])
+        if combo and combo in self.labels:
+            pool = self.labels[combo]
+            if self.acoustic_only:
+                pool = pool[5:] if len(pool) > 5 else pool
+            if self.augment and pool:
+                text = random.choice(pool)
+            elif self.acoustic_only and pool:
+                text = random.choice(pool)
 
         return {
             # keep the batch dim (1, …) — collate_precomputed_fn cats along dim 0
@@ -1045,6 +1061,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Beta distribution alpha for within-combo mixup (default 0.4; 0 to disable). "
              "Blends same-species mel spectrograms — keeps positive mask valid.",
     )
+    ap.add_argument(
+        "--acoustic-only",
+        action="store_true",
+        help="Train only on rich acoustic descriptions (label indices 5+), "
+             "dropping all taxonomy/name text. Use when species ID is handled "
+             "by a separate classifier (e.g. BirdNET) and CLAP should focus "
+             "purely on acoustic semantic understanding.",
+    )
     return ap.parse_args(argv)
 
 
@@ -1122,24 +1146,30 @@ def main(argv: list[str] | None = None) -> int:
                 f"Run scripts/precompute_clap_features.py to enable the fast path."
             )
 
-    do_augment  = not args.no_augment
-    labels_path = Path(args.labels) if Path(args.labels).exists() else None
+    do_augment    = not args.no_augment
+    acoustic_only = args.acoustic_only
+    labels_path   = Path(args.labels) if Path(args.labels).exists() else None
     if labels_path:
         print(f"  Text augmentation: label pool from {labels_path}")
     else:
         print(f"  [warn] Labels file not found at {args.labels} — text augmentation disabled")
+    if acoustic_only:
+        print(f"  ** ACOUSTIC-ONLY mode: training on rich descriptions only (indices 5+), "
+              f"no taxonomy/species-name text **")
 
     if use_precomputed:
         train_ds = ClapPrecomputedDataset(Path(args.train_pairs), audio_root,
-                                          augment=do_augment, labels_path=labels_path)
+                                          augment=do_augment, labels_path=labels_path,
+                                          acoustic_only=acoustic_only)
         val_ds   = ClapPrecomputedDataset(Path(args.val_pairs),   audio_root,
-                                          augment=False)
+                                          augment=False, acoustic_only=acoustic_only)
         _collate = partial(collate_precomputed_fn, tokenizer=processor.tokenizer)
     else:
         train_ds = ClapPairDataset(Path(args.train_pairs), audio_root, clip_s=args.clip_s,
-                                   augment=do_augment, labels_path=labels_path)
+                                   augment=do_augment, labels_path=labels_path,
+                                   acoustic_only=acoustic_only)
         val_ds   = ClapPairDataset(Path(args.val_pairs),   audio_root, clip_s=args.clip_s,
-                                   augment=False)
+                                   augment=False, acoustic_only=acoustic_only)
         _collate = partial(collate_fn, processor=processor, sr=TARGET_SR)
 
     aug_desc = "off" if not do_augment else (
