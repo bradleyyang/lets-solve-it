@@ -10,19 +10,23 @@ export function HomePage() {
 
   return (
     <div className="page home-page">
+      <p className="instrument-strip">
+        Prototype workspace · mock dataset · no server round-trip
+      </p>
       <header className="page-header">
-        <h1>Dashboard</h1>
+        <h1>Overview</h1>
         <p className="muted">
-          Explore uploads, search the (mock) indexed dataset, and switch between common names and
-          scientific names — all wired for a future CLAP backend.
+          Use this workspace to inspect uploads, run text search against a simulated catalog, and
+          switch taxonomic labels. Behaviour is deterministic in-browser; a future service could
+          replace the mock APIs without changing navigation.
         </p>
       </header>
 
       <section className="panel">
-        <h2>Upload audio</h2>
+        <h2>Audio intake</h2>
         <p className="muted">
-          Select a recording; we decode it in the browser and draw a spectrogram preview — no
-          server required.
+          Select a recording. The waveform is decoded locally and a coarse spectrogram is rendered
+          for orientation only.
         </p>
         <div className="row gap">
           <label className="file-input">
@@ -48,37 +52,38 @@ export function HomePage() {
         </div>
         <p>
           <Link to="/query" className="btn btn--primary">
-            Continue to Query with this clip
+            Open query with this clip
           </Link>
         </p>
       </section>
 
       <section className="panel">
-        <h2>Search the dataset</h2>
+        <h2>Catalog search</h2>
         <p className="muted">
-          Run text queries against a mocked catalog of Xeno-canto–style rows (species, vocalization,
-          duration).
+          Run substring queries against a static mock table (species label, vocalization class,
+          duration metadata).
         </p>
         <Link to="/query?source=dataset" className="btn btn--primary">
-          Open dataset search
+          Dataset search
         </Link>
       </section>
 
       <section className="panel">
-        <h2>Classification + query</h2>
+        <h2>Classification &amp; similarity</h2>
         <p className="muted">
-          On the Query page, upload a clip to see mock top‑k species scores, then search for similar
-          mock hits.
+          On the Query view, an uploaded clip can drive a fixed mock classifier and a mock
+          nearest-neighbour list over the same catalog.
         </p>
         <Link to="/query" className="btn btn--outline">
-          Go to Query
+          Query workspace
         </Link>
       </section>
 
       <section className="panel">
-        <h2>Vocabulary mode</h2>
+        <h2>Taxonomic display</h2>
         <p className="muted">
-          Prefer natural language names or scientific names when searching — stored in your browser.
+          Prefer common or scientific names in search strings. Preference is persisted in{" "}
+          <code className="doc-code">localStorage</code>.
         </p>
         <div className="segmented" role="group" aria-label="Vocabulary mode">
           <button

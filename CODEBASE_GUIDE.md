@@ -10,15 +10,16 @@ This document is for **new teammates** and for **LLM-assisted coding**: it state
 Use **audio** (especially birds and wildlife) together with **text** so users can **search or retrieve clips** using natural language — often discussed in terms of **joint audio–text embeddings** (e.g. CLAP-style models), separate from classic **species-only classifiers**.
 
 **What this repository actually implements today**  
-A **data pipeline + fine-tuning** workspace:
+A **data pipeline + fine-tuning** workspace **and** a **client-only web prototype** for exploring UX flows:
 
 1. **Fetch metadata** from [Xeno-canto](https://xeno-canto.org/) API v3 for a fixed query (\cnt:canada\) and export a **unified CSV**.
 2. **Explore** that CSV (counts, missing fields, bird vs non-bird heuristics) in a notebook.
 3. **Bulk-download** ~17 k audio recordings with adaptive concurrency and resume support.
 4. **Build training labels** using multi-template taxonomy strings and RAG-enriched descriptions.
 5. **Fine-tune CLAP** (\laion/clap-htsat-fused\) on 96 k \(audio, text)\ pairs with contrastive loss, AMP, and gradient accumulation.
+6. **`web/`** — Vite + React SPA: mock search/classification, saved list, compare slots, and a **Three.js** temporal embedding visualization (see **`web/docs/README.md`**).
 
-There is no production web app or API server yet.
+There is **no production API server** in this repo; the web app runs entirely in the browser with mocked data except for optional **Web Audio** decoding of user uploads.
 
 ---
 
@@ -52,6 +53,10 @@ There is no production web app or API server yet.
 | `docs/train_clap.md` | Full reference for `train_clap.py` |
 | `docs/download_xc_audio.md` | Full reference for the bulk downloader scripts |
 | `checkpoints/` | **Gitignored** — `best.pt` and `latest.pt` written by `train_clap.py` |
+| `web/` | **React + Vite** prototype UI — mock catalog, uploads, 3D viz; onboarding in **`web/docs/`** |
+| `web/docs/README.md` | Index to web feature + development docs |
+| `web/docs/FEATURES.md` | Full feature map of the SPA (routes, state, mocks, viz pipeline) |
+| `web/docs/DEVELOPMENT.md` | Run/build, aliases, extension notes for web |
 
 **Notebooks may write CSVs relative to the Jupyter **current working directory** (often `scripts/` if the server was started there). The fetch notebook saves `xc_metadata_unified.csv` next to the CWD; `check_environment.py` and `mini_clap_xc_sample.py` look in **`scripts/` first**, then repo root.
 
@@ -105,7 +110,7 @@ filepath,species_code,common_name,vocalization_type,quality_rating,duration,sour
 ### Not done (out of scope or future work)
 
 - Bird-only filtering (explicit taxon rules or allowlist).
-- Dashboard / API server.
+- **Backend API** wired to real embeddings / Xeno-canto (the `web/` app is mock-first; swap `web/src/api/mock.ts` when ready).
 - Evaluation harness / retrieval benchmark beyond R@1.
 - Multi-GPU / distributed training.
 - LoRA / PEFT (currently full fine-tune only).
@@ -255,3 +260,15 @@ Jupyter: open `scripts/get_xenocanto.ipynb` or `scripts/eda_xc_metadata.ipynb` (
 - **Model choice** (HF checkpoint vs fine-tune): team ML lead / mentor.
 
 This guide should be **updated** when the CSV schema, default queries, or primary CLAP stack changes.
+
+---
+
+## 10. Web client (`web/`) — pointer for ML / pipeline developers
+
+If you only touch Python and data: you can ignore `web/` until you need to demo retrieval UX. When you do:
+
+- **Onboarding:** start at [`web/docs/README.md`](web/docs/README.md) → [`FEATURES.md`](web/docs/FEATURES.md).
+- **Run locally:** `cd web && npm install && npm run dev`.
+- **Contract:** UI types live in `web/src/api/types.ts`; mock responses in `web/src/api/mock.ts`. Keeping names/fields aligned with a future REST or gRPC API will reduce UI churn.
+
+Web documentation belongs under **`web/docs/`**; this root guide stays focused on data + training scripts.

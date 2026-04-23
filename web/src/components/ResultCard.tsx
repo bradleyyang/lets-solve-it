@@ -82,10 +82,10 @@ export function ResultCard({ result, spectrogramFile }: ResultCardProps) {
           className="btn btn--ghost"
           onClick={() => navigate(`/viz/${result.id}`)}
         >
-          3D sound
+          Embedding
         </button>
         <button type="button" className="btn btn--ghost" onClick={handleCompare}>
-          Compare
+          Compare slot
         </button>
         <button
           type="button"
@@ -93,7 +93,7 @@ export function ResultCard({ result, spectrogramFile }: ResultCardProps) {
           onClick={() => toggle(result)}
           aria-pressed={saved}
         >
-          {saved ? "★ Saved" : "☆ Save"}
+          {saved ? "Saved" : "Save"}
         </button>
       </div>
     </article>

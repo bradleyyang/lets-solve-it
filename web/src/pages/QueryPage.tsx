@@ -66,10 +66,10 @@ export function QueryPage() {
   return (
     <div className="page query-page">
       <header className="page-header">
-        <h1>Query</h1>
+        <h1>Query workspace</h1>
         <p className="muted">
-          Text search against the mock dataset, or upload audio for mock classification and
-          similarity search.
+          Text retrieval against a static mock table, optional upload-driven classification scores,
+          and mock acoustic similarity — all evaluated client-side.
         </p>
       </header>
 
@@ -97,7 +97,7 @@ export function QueryPage() {
       </section>
 
       <section className="panel">
-        <h2>Dataset search</h2>
+        <h2>Catalog search</h2>
         <div className="row gap wrap">
           <input
             type="search"
@@ -118,7 +118,7 @@ export function QueryPage() {
       </section>
 
       <section className="panel">
-        <h2>Upload & classification</h2>
+        <h2>Upload &amp; classifier output</h2>
         <div className="row gap wrap">
           <label className="file-input">
             <input
@@ -155,7 +155,7 @@ export function QueryPage() {
         </div>
         {classifyHits ? (
           <div className="classify-hits">
-            <h3>Top labels (mock)</h3>
+            <h3>Posterior over labels (mock)</h3>
             <ol>
               {classifyHits.map((h) => (
                 <li key={h.label}>
@@ -173,9 +173,9 @@ export function QueryPage() {
 
       <section className="panel">
         <div className="row spread">
-          <h2>Results</h2>
-          <Link to="/saved" className="muted">
-            View saved →
+          <h2>Result set</h2>
+          <Link to="/saved" className="muted small">
+            Saved list →
           </Link>
         </div>
         {results.length === 0 ? (
