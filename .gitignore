@@ -1,4 +1,4 @@
-.venv
+venv
 .env
 .env*
 .venv*
@@ -16,4 +16,5 @@ web/.vite/
 
 # Optional local caches
 *.log
+!logs/**/*.log
 npm-debug.log*
