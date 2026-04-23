@@ -51,12 +51,12 @@
   },
   {
     "query": "haunting wail echoing across a lake, long and eerie",
-    "positive_combos": ["Common Loon||wail"],
+    "positive_combos": ["Common Loon||call"],
     "_note": "plain description"
   },
   {
     "query": "melancholy quavering cry that carries a long distance over water",
-    "positive_combos": ["Common Loon||wail"],
+    "positive_combos": ["Common Loon||call"],
     "_note": "evocative plain description"
   },
   {

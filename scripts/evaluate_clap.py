@@ -70,7 +70,6 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn.functional as F
 from transformers import ClapModel, ClapProcessor
@@ -80,7 +79,6 @@ DEFAULT_MODEL         = "laion/clap-htsat-fused"
 DEFAULT_VAL_PAIRS     = Path("data/clap_val_pairs.json")
 DEFAULT_HOLDOUT_PAIRS = Path("data/clap_holdout_pairs.json")
 DEFAULT_HOLDOUT_DESCS = Path("data/clap_descriptions_holdout.json")
-DEFAULT_METADATA      = Path("data/xc_metadata_unified.csv")
 DEFAULT_LABELS        = Path("data/clap_all_labels.json")
 DEFAULT_TAXONOMY      = Path("data/species_taxonomy.json")
 DEFAULT_AUDIO_ROOT    = Path(".")
@@ -1121,7 +1119,6 @@ def main():
                         help="Path to clap_holdout_pairs.json for zero-shot species eval")
     parser.add_argument("--holdout-descs",  default=str(DEFAULT_HOLDOUT_DESCS),
                         help="Path to clap_descriptions_holdout.json for held-out acoustic query eval")
-    parser.add_argument("--metadata",       default=str(DEFAULT_METADATA))
     parser.add_argument("--labels",         default=str(DEFAULT_LABELS))
     parser.add_argument("--taxonomy",       default=str(DEFAULT_TAXONOMY))
     parser.add_argument("--audio-root",     default=str(DEFAULT_AUDIO_ROOT))
@@ -1163,17 +1160,20 @@ def main():
     else:
         print(f"[info] No held-out descriptions at {holdout_desc_path} — rich_holdout strategy skipped")
 
-    df       = pd.read_csv(args.metadata, encoding="utf-8")
-    name_col = next((c for c in ("common_name", "species", "name") if c in df.columns), None)
-    type_col = next((c for c in ("vocalization_type", "type") if c in df.columns), None)
-    path_col = next((c for c in ("filepath", "file_path", "path", "filename") if c in df.columns), None)
-    clip_to_combo = {
-        str(row[path_col]).strip(): (
-            str(row[name_col]).strip(),
-            str(row[type_col]).split(",")[0].strip().lower()
-        )
-        for _, row in df.iterrows()
-    }
+    # Build clip→combo mapping from the pairs JSON itself (every pair has a
+    # "combo" field like "Virginia Rail||call"), so we don't need the metadata CSV.
+    # Merge all pair sources so holdout clips are also covered.
+    all_pair_sources = list(val_pairs)
+    holdout_pairs_path = Path(args.holdout_pairs)
+    if holdout_pairs_path.exists():
+        all_pair_sources += json.loads(holdout_pairs_path.read_text(encoding="utf-8"))
+    clip_to_combo: dict[str, tuple[str, str]] = {}
+    for p in all_pair_sources:
+        audio = p["audio"]
+        combo_str = p.get("combo", "")
+        if audio not in clip_to_combo and "||" in combo_str:
+            sp, vt = combo_str.split("||", 1)
+            clip_to_combo[audio] = (sp.strip(), vt.strip().lower())
 
     seen, val_clips = set(), []
     for p in val_pairs:
