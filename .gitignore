@@ -16,4 +16,5 @@ web/.vite/
 
 # Optional local caches
 *.log
+!training_8th_finetune.log
 npm-debug.log*
