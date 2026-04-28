@@ -9,8 +9,8 @@ checkpoints/
 training_run.log.utf16le.bak
 convert_wav.log.utf16le.bak
 
-# Frontend — dependencies and build output (never commit)
-web/node_modules/
+# JavaScript / Node — never commit dependencies or Vite cache/build
+**/node_modules/
 web/dist/
 web/.vite/
 
