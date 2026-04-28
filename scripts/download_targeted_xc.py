@@ -376,7 +376,7 @@ class _AdaptiveLimiter:
                     self._cap = new
                     self._times.clear()
                     tqdm.write(
-                        f"[adaptive] 429 burst → concurrency {old} → {new}",
+                        f"[adaptive] 429 burst -> concurrency {old} -> {new}",
                         file=sys.stderr,
                     )
                 self._cond.notify_all()
@@ -661,15 +661,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR: {label} file not found: {p}", file=sys.stderr)
             return 1
 
-    print(f"Loading labels … {labels_path}")
+    print(f"Loading labels ... {labels_path}")
     labels: dict = json.loads(labels_path.read_text(encoding="utf-8"))
 
-    print(f"Loading taxonomy … {tax_path}")
+    print(f"Loading taxonomy ... {tax_path}")
     tax_db: dict = json.loads(tax_path.read_text(encoding="utf-8"))
 
     # ── Phase 1: audit ────────────────────────────────────────────────────────
     if not args.download_only:
-        print(f"\nAuditing coverage ({csv_path.name}) …")
+        print(f"\nAuditing coverage ({csv_path.name}) ...")
         weak = audit_coverage(csv_path, labels, tax_db, args.min_recordings)
 
         total_combos = sum(1 for k in labels
@@ -727,7 +727,7 @@ def main(argv: list[str] | None = None) -> int:
                       f"{len(existing_scheduled)} downloads already planned.")
 
         # Existing CSV IDs (so we never re-download)
-        print(f"Reading existing IDs from {csv_path.name} …")
+        print(f"Reading existing IDs from {csv_path.name} ...")
         exist_ids = existing_xc_ids(csv_path)
         # Also add IDs from any rows already scheduled (to avoid scheduling them again)
         for r in existing_scheduled:
@@ -745,7 +745,7 @@ def main(argv: list[str] | None = None) -> int:
             if sp not in already_fetched
         ]
 
-        print(f"\nPhase 2+3: fetching XC metadata for {len(todo_species)} species …")
+        print(f"\nPhase 2+3: fetching XC metadata for {len(todo_species)} species ...")
         new_scheduled: list[dict] = []
 
         for i, (species, combos) in enumerate(tqdm(todo_species, desc="species", unit="sp")):
@@ -758,7 +758,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             tqdm.write(
                 f"  {species} ({scientific or 'no sci'})  "
-                f"→ {len(all_recs)} global recs from XC"
+                f"-> {len(all_recs)} global recs from XC"
             )
 
             if all_recs:
@@ -822,7 +822,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # ── Phase 4: download ─────────────────────────────────────────────────────
-    print(f"\nPhase 4: downloading {len(scheduled)} audio files …")
+    print(f"\nPhase 4: downloading {len(scheduled)} audio files ...")
     print(f"  Audio root : {audio_root.resolve()}")
     print(f"  Manifest   : {manifest.resolve()}")
     print(f"  Workers    : {args.workers} (adaptive, floor {args.min_workers})")
@@ -859,7 +859,7 @@ def main(argv: list[str] | None = None) -> int:
         rows_to_append = scheduled
 
     if rows_to_append:
-        print(f"\nPhase 5: appending {len(rows_to_append)} rows to {csv_path.name} …")
+        print(f"\nPhase 5: appending {len(rows_to_append)} rows to {csv_path.name} ...")
         append_to_csv(csv_path, rows_to_append)
     else:
         print("\nPhase 5: nothing to append (no successful downloads).")

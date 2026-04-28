@@ -221,12 +221,23 @@ def main():
     # Deterministic holdout species selection (sorted alphabetically → every Nth)
     holdout_species: set[str] = set()
     if args.holdout_species_frac > 0:
-        all_species = sorted({
-            str(row[next((c for c in ("common_name","species","name") if c in pd.read_csv(p).columns), None)]).strip()
-            for p in args.metadata if Path(p).exists()
-            for _, row in pd.read_csv(p).iterrows()
-            if tax_db.get(str(row.get("common_name","")).strip(), {}).get("class") == "Aves"
-        })
+        species_names: set[str] = set()
+        for p in args.metadata:
+            meta_path = Path(p)
+            if not meta_path.exists():
+                continue
+            df = pd.read_csv(meta_path)
+            name_col = next(
+                (c for c in ("common_name", "species", "name") if c in df.columns),
+                None,
+            )
+            if name_col is None:
+                continue
+            for _, row in df.iterrows():
+                if tax_db.get(str(row.get("common_name", "")).strip(), {}).get("class") != "Aves":
+                    continue
+                species_names.add(str(row[name_col]).strip())
+        all_species = sorted(species_names)
         step = max(1, round(1.0 / args.holdout_species_frac))
         holdout_species = set(all_species[::step])
         print(f"Holdout species : {len(holdout_species)} / {len(all_species)} "
