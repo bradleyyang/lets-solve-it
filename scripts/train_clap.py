@@ -1048,6 +1048,146 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return ap.parse_args(argv)
 
 
+# ── audit helpers ──────────────────────────────────────────────────────────────
+
+def _audit_start(args: argparse.Namespace, ckpt_dir: Path,
+                 n_train: int, n_val: int,
+                 use_precomputed: bool, do_augment: bool) -> Path:
+    """Write an audit stub at training start; return the audit file path.
+
+    The stub captures every hyperparameter so that even if training is
+    interrupted the config is on disk.  The epoch table and final summary
+    are appended by _audit_finalize() when training completes.
+
+    Enforced rule: every checkpoint directory gets a TRAINING_AUDIT.md.
+    If the file already exists (from a previous run in the same dir) it is
+    overwritten — this covers the warm-start / resume case.
+    """
+    import datetime as _dt
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    audit_path = ckpt_dir / "TRAINING_AUDIT.md"
+
+    run_name = ckpt_dir.name
+    now      = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    warmstart_line = ""
+    if args.finetune_from:
+        warmstart_line = f"| Warm-start from | `{args.finetune_from}` |"
+    elif args.resume:
+        warmstart_line = f"| Resumed from | `{args.resume}` |"
+    else:
+        warmstart_line = "| Starting weights | fresh (`laion/clap-htsat-fused` pretrained only) |"
+
+    aug_str = "off" if not do_augment else (
+        f"random crop, noise/gain, SpecAugment, text aug"
+        + (f", mixup α={args.mixup_alpha}" if args.mixup_alpha > 0 else "")
+    )
+
+    lines = [
+        f"# Training Audit — {run_name}",
+        "",
+        f"> **Auto-generated** by `scripts/train_clap.py` on {now}.",
+        f"> Fill in sections marked **TODO** after reviewing results.",
+        "",
+        "---",
+        "",
+        "## 1. Configuration",
+        "",
+        "| Parameter | Value |",
+        "|-----------|-------|",
+        f"| Base model | `{args.model}` |",
+        f"| Checkpoint dir | `{ckpt_dir}` |",
+        warmstart_line,
+        f"| Epochs | {args.epochs} |",
+        f"| Batch size | {args.batch_size} × accum {args.accum} = effective {args.batch_size * args.accum} |",
+        f"| Base LR | {args.lr} |",
+        f"| Audio encoder LR | {args.lr * args.lr_audio_mult:.2e} (×{args.lr_audio_mult}) |",
+        f"| Text encoder LR | {args.lr * args.lr_text_mult:.2e} (×{args.lr_text_mult}) |",
+        f"| Warmup steps | {args.warmup_steps} |",
+        f"| Augmentation | {aug_str} |",
+        f"| Freeze text epochs | {args.freeze_text_epochs} |",
+        f"| Freeze logscale epochs | {args.freeze_logscale_epochs} |",
+        f"| Data mode | {'pre-computed .clap.pt' if use_precomputed else 'raw audio'} |",
+        f"| Train pairs | {n_train:,} |",
+        f"| Val pairs | {n_val:,} |",
+        f"| Hard negatives | {'enabled (same-genus)' if Path(args.taxonomy).exists() else 'disabled (taxonomy not found)'} |",
+        f"| Seed | {args.seed} |",
+        "",
+        "---",
+        "",
+        "## 2. Epoch Training Curve",
+        "",
+        "| Epoch | train_loss | val_loss | R@1 | Time | Notes |",
+        "|------:|-----------:|---------:|----:|-----:|-------|",
+        "<!-- EPOCH_ROWS_PLACEHOLDER -->",
+        "",
+        "---",
+        "",
+        "## 3. Evaluation Results",
+        "",
+        "> **TODO:** paste eval metrics here after running `scripts/evaluate_clap.py`.",
+        "> Key numbers to record: mAP, R@1, R@10, median_first_rank for",
+        "> `all_variants`, `name`, `rich_holdout`, `finetuned_zeroshot`.",
+        "",
+        "---",
+        "",
+        "## 4. What Worked / What Didn't",
+        "",
+        "> **TODO:** fill in after reviewing eval results.",
+        ">",
+        "> Suggested structure:",
+        "> - Did train/val loss converge cleanly?",
+        "> - Which species/combo were hardest? (see class_breakdown chart)",
+        "> - Did augmentation help or hurt?",
+        "> - Was the warm-start checkpoint healthy? (check initial batch loss — should be <4.5)",
+        "> - Compare R@1 vs previous best run.",
+        "",
+        "---",
+        "",
+        "## 5. Action Items for Next Run",
+        "",
+        "> **TODO:** fill in after analysis.",
+        "",
+        "---",
+        "",
+        "*This file is auto-generated at training start and finalized at training end.*",
+        "*Narrative sections must be filled in manually.*",
+    ]
+    audit_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"\n[AUDIT] Stub written: {audit_path}")
+    print(f"[AUDIT] Fill in sections 3-5 after training + eval.\n")
+    return audit_path
+
+
+def _audit_finalize(audit_path: Path,
+                    epoch_rows: list[tuple],
+                    best_val_loss: float) -> None:
+    """Replace the epoch row placeholder and append a completion timestamp."""
+    import datetime as _dt
+    if not audit_path.is_file():
+        return
+
+    row_lines = []
+    for (ep, tl, vl, r1, elapsed, note) in epoch_rows:
+        row_lines.append(
+            f"| {ep:02d} | {tl:.4f} | {vl:.4f} | {r1:.4f} | {elapsed:.0f}s | {note} |"
+        )
+
+    text = audit_path.read_text(encoding="utf-8")
+    text = text.replace(
+        "<!-- EPOCH_ROWS_PLACEHOLDER -->",
+        "\n".join(row_lines) if row_lines else "*(no epochs recorded)*",
+    )
+    footer = (
+        f"\n---\n\n"
+        f"*Training completed {_dt.datetime.now().strftime('%Y-%m-%d %H:%M')}. "
+        f"Best val loss: {best_val_loss:.4f}.*\n"
+    )
+    audit_path.write_text(text + footer, encoding="utf-8")
+    print(f"\n[AUDIT] Epoch table written to {audit_path}")
+    print(f"[AUDIT] *** ACTION REQUIRED: fill in sections 3-5 of {audit_path} ***\n")
+
+
 # ── main ───────────────────────────────────────────────────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
@@ -1312,6 +1452,10 @@ def main(argv: list[str] | None = None) -> int:
              else "Pareto-optimal (saved only if best on ≥1 metric)"))
     print(f"{'-' * 60}\n")
 
+    audit_path  = _audit_start(args, ckpt_dir, len(train_ds), len(val_ds),
+                                use_precomputed, do_augment)
+    audit_rows: list[tuple] = []
+
     pareto = (None if args.no_epoch_checkpoints
               else ParetoCheckpointManager(ckpt_dir, args.epoch_checkpoints_subdir))
 
@@ -1355,6 +1499,7 @@ def main(argv: list[str] | None = None) -> int:
             f"R@1={r1:.4f}  "
             f"({elapsed:.0f}s)"
         )
+        audit_rows.append((epoch, train_loss, val_loss, r1, elapsed, ""))
 
         # Update best before saving latest (latest.pt must carry correct best_val_loss for resume)
         if val_loss < best_val_loss:
@@ -1379,6 +1524,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\nTraining complete.  Best val loss: {best_val_loss:.4f}")
     print(f"Checkpoints: {ckpt_dir.resolve()}")
+    _audit_finalize(audit_path, audit_rows, best_val_loss)
     return 0
 
 
